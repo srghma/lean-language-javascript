@@ -1,9 +1,17 @@
 name = "LanguageJavascript"
-defaultTargets = ["LanguageJavascript"]
+defaultTargets = ["LanguageJavascript", "LanguageJavascriptMini", "LanguageJavascriptBrujin"]
 
 [[lean_lib]]
 name = "LanguageJavascript"
 globs = ["LanguageJavascript.+"]
+
+[[lean_lib]]
+name = "LanguageJavascriptMini"
+globs = ["LanguageJavascriptMini.+"]
+
+[[lean_lib]]
+name = "LanguageJavascriptBrujin"
+globs = ["LanguageJavascriptBrujin.+"]
 
 [[lean_exe]]
 name = "tests"
