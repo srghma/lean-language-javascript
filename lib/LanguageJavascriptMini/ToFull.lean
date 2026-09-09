@@ -13,7 +13,7 @@ What the conversion *does* guarantee is that no meaning is lost:
 `ofAST (toAST p) = p` for every `MiniProgram p` that the annotated AST can
 represent (see `RequestProject/Tests/MiniAST.lean`).
 -/
-import LanguageJavascriptMini.OfFUll
+import LanguageJavascriptMini.OfFull
 import LanguageJavascriptMini.Printer
 import LanguageJavascript.Printer
 

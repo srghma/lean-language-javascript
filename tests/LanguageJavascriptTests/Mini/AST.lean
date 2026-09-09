@@ -6,12 +6,17 @@ syntax of `MiniASTElab`.
 There is no Haskell counterpart for these — the deterministic AST is an
 addition to the port — so the expected values were written here.
 -/
-import RequestProject.Tests.Utils
-import RequestProject.JavaScript.MiniASTElab
-import RequestProject.JavaScript.MiniASTToAST
+import Spec
+import LanguageJavascriptMini.AST
+import LanguageJavascriptMini.Printer
+import LanguageJavascriptMini.OfFull
+import LanguageJavascriptMini.ToFull
+import LanguageJavascriptMini.Elab
 
-namespace Test.Language.Javascript
+namespace LanguageJavascriptTests.Mini.AST
 
+open Spec
+open Spec.Assert
 open Language.JavaScript.MiniAST
 
 /-- Parse and print in the canonical style. -/
@@ -46,93 +51,50 @@ def miniViaASTSource (src : String) : String :=
       toString (match parse (renderViaAST p) with | .ok q => q == p | .error _ => false)
   | .error e => "ERROR: " ++ e
 
-/-! ## The printed layout -/
-
-def testMiniPrint : List Test :=
-  [ shouldBe "var x = 1" (miniPrint "var x = 1") "var x = 1;\n"
-    -- the layout of the input is not preserved
-  , shouldBe "import  def  from 'mod'" (miniPrint "import  def  from 'mod'")
-      "import def from \"mod\";\n"
-  , shouldBe "function f(a,b){return a+b*2}" (miniPrint "function f(a,b){return a+b*2}")
-      "function f(a, b) {\n  return a + b * 2;\n}\n"
-  , shouldBe "if(x){f(1,2)}else{f(3,4)}" (miniPrint "if(x){f(1,2)}else{f(3,4)}")
-      "if (x) {\n  f(1, 2);\n} else {\n  f(3, 4);\n}\n"
-  , shouldBe "if (a) b(); else c();" (miniPrint "if (a) b(); else c();")
-      "if (a) b();\nelse c();\n"
-  , shouldBe "const o={a:1,'b b':2,[c]:3};" (miniPrint "const o={a:1,'b b':2,[c]:3};")
-      "const o = { a: 1, \"b b\": 2, [c]: 3 };\n"
-    -- a construct which does not fit into 80 columns is broken, one entry
-    -- per line, with a trailing comma
-  , shouldBe "long object literal"
-      (miniPrint "const big={alpha:1,beta:2,gamma:3,delta:4,epsilon:5,zeta:66666,eta:77777,theta:8};")
-      ("const big = {\n  alpha: 1,\n  beta: 2,\n  gamma: 3,\n  delta: 4,\n  epsilon: 5,\n"
-        ++ "  zeta: 66666,\n  eta: 77777,\n  theta: 8,\n};\n")
-  , shouldBe "let arr=[1,,2,];" (miniPrint "let arr=[1,,2,];") "let arr = [1, , 2];\n"
-  , shouldBe "class"
-      (miniPrint "class A extends B{constructor(x){super(x)}static c(){}*g(){yield 1}get v(){return 1}}")
-      ("class A extends B {\n  constructor(x) {\n    super(x);\n  }\n  static c() {}\n"
-        ++ "  *g() {\n    yield 1;\n  }\n  get v() {\n    return 1;\n  }\n}\n")
-  , shouldBe "try{a()}catch(e){b()}finally{c()}" (miniPrint "try{a()}catch(e){b()}finally{c()}")
-      "try {\n  a();\n} catch (e) {\n  b();\n} finally {\n  c();\n}\n"
-  , shouldBe "switch(x){case 1:a();break;default:b()}"
-      (miniPrint "switch(x){case 1:a();break;default:b()}")
-      "switch (x) {\n  case 1:\n    a();\n    break;\n  default:\n    b();\n}\n"
-  , shouldBe "for(let i=0;i<10;i++)console.log(i);"
-      (miniPrint "for(let i=0;i<10;i++)console.log(i);")
-      "for (let i = 0; i < 10; i++) console.log(i);\n"
-  , shouldBe "for(;;);" (miniPrint "for(;;);") "for (;;);\n"
-  , shouldBe "do{x++}while(x<3);" (miniPrint "do{x++}while(x<3);")
-      "do {\n  x++;\n} while (x < 3);\n"
-  , shouldBe "label:while(1){break label}" (miniPrint "label:while(1){break label}")
-      "label: while (1) {\n  break label;\n}\n"
-    -- parentheses are not stored; they are put back where they are needed
-  , shouldBe "x=(a+b)*c;y=a+(b*c);z=-(-1);" (miniPrint "x=(a+b)*c;y=a+(b*c);z=-(-1);")
-      "x = (a + b) * c;\ny = a + b * c;\nz = -(-1);\n"
-  , shouldBe "let g=x=>({y:1});(function(){})();" (miniPrint "let g=x=>({y:1});(function(){})();")
-      "let g = (x) => ({ y: 1 });\n(function () {})();\n"
-    -- literals are normalised
-  , shouldBe "literals" (miniPrint "let s=`a${b}c`;let r=/ab+/gi;let n=0XFF;let m=1.50;let q=.5e+07;")
-      "let s = `a${b}c`;\nlet r = /ab+/gi;\nlet n = 0xff;\nlet m = 1.5;\nlet q = 0.5e7;\n"
-  , shouldBe "quotes" (miniPrint "x = 'it\\'s';y=\"say \\\"hi\\\"\";z='\\u0041\\n';")
-      "x = \"it's\";\ny = 'say \"hi\"';\nz = \"A\\n\";\n"
-  , shouldBe "export {a as b} from 'm';export const x=1;"
-      (miniPrint "export {a as b} from 'm';export const x=1;")
-      "export { a as b } from \"m\";\nexport const x = 1;\n"
-  , shouldBe "f(...args);function g(a,...rest){}" (miniPrint "f(...args);function g(a,...rest){}")
-      "f(...args);\nfunction g(a, ...rest) {}\n"
-  , shouldBe "a.b.c(1)[2].d;new Foo;new a.b(1);" (miniPrint "a.b.c(1)[2].d;new Foo;new a.b(1);")
-      "a.b.c(1)[2].d;\nnew Foo();\nnew a.b(1);\n"
-    -- an empty program prints as nothing
-  , shouldBe "(empty)" (miniPrint "") ""
+def printCases : List (String × String × String) :=
+  [ ("var x = 1", miniPrint "var x = 1", "var x = 1;\n")
+  , ("import  def  from 'mod'", miniPrint "import  def  from 'mod'", "import def from \"mod\";\n")
+  , ("function f(a,b){return a+b*2}", miniPrint "function f(a,b){return a+b*2}", "function f(a, b) {\n  return a + b * 2;\n}\n")
+  , ("if(x){f(1,2)}else{f(3,4)}", miniPrint "if(x){f(1,2)}else{f(3,4)}", "if (x) {\n  f(1, 2);\n} else {\n  f(3, 4);\n}\n")
+  , ("if (a) b(); else c();", miniPrint "if (a) b(); else c();", "if (a) b();\nelse c();\n")
+  , ("const o={a:1,'b b':2,[c]:3};", miniPrint "const o={a:1,'b b':2,[c]:3};", "const o = { a: 1, \"b b\": 2, [c]: 3 };\n")
+  , ("long object literal", miniPrint "const big={alpha:1,beta:2,gamma:3,delta:4,epsilon:5,zeta:66666,eta:77777,theta:8};", "const big = {\n  alpha: 1,\n  beta: 2,\n  gamma: 3,\n  delta: 4,\n  epsilon: 5,\n  zeta: 66666,\n  eta: 77777,\n  theta: 8,\n};\n")
+  , ("let arr=[1,,2,];", miniPrint "let arr=[1,,2,];", "let arr = [1, , 2];\n")
+  , ("class", miniPrint "class A extends B{constructor(x){super(x)}static c(){}*g(){yield 1}get v(){return 1}}", "class A extends B {\n  constructor(x) {\n    super(x);\n  }\n  static c() {}\n  *g() {\n    yield 1;\n  }\n  get v() {\n    return 1;\n  }\n}\n")
+  , ("try{a()}catch(e){b()}finally{c()}", miniPrint "try{a()}catch(e){b()}finally{c()}", "try {\n  a();\n} catch (e) {\n  b();\n} finally {\n  c();\n}\n")
+  , ("switch(x){case 1:a();break;default:b()}", miniPrint "switch(x){case 1:a();break;default:b()}", "switch (x) {\n  case 1:\n    a();\n    break;\n  default:\n    b();\n}\n")
+  , ("for(let i=0;i<10;i++)console.log(i);", miniPrint "for(let i=0;i<10;i++)console.log(i);", "for (let i = 0; i < 10; i++) console.log(i);\n")
+  , ("for(;;);", miniPrint "for(;;);", "for (;;);\n")
+  , ("do{x++}while(x<3);", miniPrint "do{x++}while(x<3);", "do {\n  x++;\n} while (x < 3);\n")
+  , ("label:while(1){break label}", miniPrint "label:while(1){break label}", "label: while (1) {\n  break label;\n}\n")
+  , ("x=(a+b)*c;y=a+(b*c);z=-(-1);", miniPrint "x=(a+b)*c;y=a+(b*c);z=-(-1);", "x = (a + b) * c;\ny = a + b * c;\nz = -(-1);\n")
+  , ("let g=x=>({y:1});(function(){})();", miniPrint "let g=x=>({y:1});(function(){})();", "let g = (x) => ({ y: 1 });\n(function () {})();\n")
+  , ("literals", miniPrint "let s=`a${b}c`;let r=/ab+/gi;let n=0XFF;let m=1.50;let q=.5e+07;", "let s = `a${b}c`;\nlet r = /ab+/gi;\nlet n = 0xff;\nlet m = 1.5;\nlet q = 0.5e7;\n")
+  , ("quotes", miniPrint "x = 'it\'s';y=\"say \"hi\"\";z='\\u0041\\n';", "x = \"it's\";\ny = 'say \"hi\"';\nz = \"A\\n\";\n")
+  , ("export {a as b} from 'm';export const x=1;", miniPrint "export {a as b} from 'm';export const x=1;", "export { a as b } from \"m\";\nexport const x = 1;\n")
+  , ("f(...args);function g(a,...rest){}", miniPrint "f(...args);function g(a,...rest){}", "f(...args);\nfunction g(a, ...rest) {}\n")
+  , ("a.b.c(1)[2].d;new Foo;new a.b(1);", miniPrint "a.b.c(1)[2].d;new Foo;new a.b(1);", "a.b.c(1)[2].d;\nnew Foo();\nnew a.b(1);\n")
+  , ("(empty)", miniPrint "", "")
   ]
 
-/-! ## Determinism
-
-Sources that differ only in what the deterministic AST does not record give
-equal trees. -/
-
-def testMiniDeterminism : List Test :=
-  [ shouldBe "whitespace" (miniSame "var  x   =  1 ;" "var x = 1;") "true"
-  , shouldBe "comments" (miniSame "var x = 1; // note\n/* here */ var y = 2;"
-      "var x = 1;\nvar y = 2;") "true"
-  , shouldBe "line breaks" (miniSame "if (a) {\n  b();\n}" "if(a){b()}") "true"
-  , shouldBe "automatic semicolon" (miniSame "var x = 1" "var x = 1;") "true"
-  , shouldBe "stray semicolons" (miniSame "var x = 1;;;" "var x = 1;") "true"
-  , shouldBe "quotes" (miniSame "x = 'a'" "x = \"a\"") "true"
-  , shouldBe "escapes" (miniSame "x = '\\u0041'" "x = 'A'") "true"
-  , shouldBe "number spelling" (miniSame "x = 1.50" "x = 1.5") "true"
-  , shouldBe "hex case" (miniSame "x = 0XFF" "x = 0xff") "true"
-  , shouldBe "redundant parentheses" (miniSame "x = (((1)));" "x = 1;") "true"
-  , shouldBe "new without arguments" (miniSame "new Foo" "new Foo()") "true"
-    -- but a real difference is still a difference
-  , shouldBe "different parentheses" (miniSame "x = (a+b)*c" "x = a+b*c") "false"
-  , shouldBe "different names" (miniSame "var x = 1" "var y = 1") "false"
-  , shouldBe "different strings" (miniSame "x = 'a'" "x = 'b'") "false"
+def determinismCases : List (String × String × String) :=
+  [ ("whitespace", miniSame "var  x   =  1 ;" "var x = 1;", "true")
+  , ("comments", miniSame "var x = 1; // note\n/* here */ var y = 2;" "var x = 1;\nvar y = 2;", "true")
+  , ("line breaks", miniSame "if (a) {\n  b();\n}" "if(a){b()}", "true")
+  , ("automatic semicolon", miniSame "var x = 1" "var x = 1;", "true")
+  , ("stray semicolons", miniSame "var x = 1;;;" "var x = 1;", "true")
+  , ("quotes", miniSame "x = 'a'" "x = \"a\"", "true")
+  , ("escapes", miniSame "x = '\\u0041'" "x = 'A'", "true")
+  , ("number spelling", miniSame "x = 1.50" "x = 1.5", "true")
+  , ("hex case", miniSame "x = 0XFF" "x = 0xff", "true")
+  , ("redundant parentheses", miniSame "x = (((1)));" "x = 1;", "true")
+  , ("new without arguments", miniSame "new Foo" "new Foo()", "true")
+  , ("different parentheses", miniSame "x = (a+b)*c" "x = a+b*c", "false")
+  , ("different names", miniSame "var x = 1" "var y = 1", "false")
+  , ("different strings", miniSame "x = 'a'" "x = 'b'", "false")
   ]
 
-/-! ## Round trips -/
-
-private def roundTripSources : List String :=
+def roundTripSources : List String :=
   [ "var x = 1, y = 2;"
   , "function f(a, b) { return a + b * 2; }"
   , "if (x) { f(1, 2) } else { g() }"
@@ -162,37 +124,25 @@ private def roundTripSources : List String :=
   , "async function f() { await g() }"
   ]
 
-def testMiniRoundTrip : List Test :=
-  (roundTripSources.map fun s => shouldBe ("print: " ++ s) (miniStable s) "true")
-    ++ (roundTripSources.map fun s => shouldBe ("toAST: " ++ s) (miniViaAST s) "true")
-    ++ (roundTripSources.map fun s => shouldBe ("render: " ++ s) (miniViaASTSource s) "true")
-
-/-! ## Literals -/
-
-def testMiniLiterals : List Test :=
-  [ shouldBe "normalizeNumber 1.50" (normalizeNumber "1.50") "1.5"
-  , shouldBe "normalizeNumber 1.00" (normalizeNumber "1.00") "1.0"
-  , shouldBe "normalizeNumber .5" (normalizeNumber ".5") "0.5"
-  , shouldBe "normalizeNumber 1." (normalizeNumber "1.") "1"
-  , shouldBe "normalizeNumber 1E+07" (normalizeNumber "1E+07") "1e7"
-  , shouldBe "normalizeNumber 1e-07" (normalizeNumber "1e-07") "1e-7"
-  , shouldBe "normalizeNumber 1e0" (normalizeNumber "1e0") "1"
-  , shouldBe "normalizeNumber 0XFF" (normalizeNumber "0XFF") "0xff"
-  , shouldBe "decode 'a\\nb'" (decodeStringLiteral "'a\\nb'") "a\nb"
-  , shouldBe "decode '\\u0041'" (decodeStringLiteral "'\\u0041'") "A"
-  , shouldBe "decode '\\x41'" (decodeStringLiteral "'\\x41'") "A"
-  , shouldBe "decode '\\u{1F600}'" (decodeStringLiteral "'\\u{1F600}'") "😀"
-  , shouldBe "decode surrogate pair" (decodeStringLiteral "'\\ud83d\\ude00'") "😀"
-  , shouldBe "encode a\\nb" (encodeStringLiteral "a\nb") "\"a\\nb\""
-  , shouldBe "encode with double quotes" (encodeStringLiteral "say \"hi\"") "'say \"hi\"'"
-  , shouldBe "encode with single quotes" (encodeStringLiteral "it's") "\"it's\""
-  , shouldBe "encode both quotes" (encodeStringLiteral "'\"") "\"'\\\"\""
+def literalCases : List (String × String × String) :=
+  [ ("normalizeNumber 1.50", normalizeNumber "1.50", "1.5")
+  , ("normalizeNumber 1.00", normalizeNumber "1.00", "1.0")
+  , ("normalizeNumber .5", normalizeNumber ".5", "0.5")
+  , ("normalizeNumber 1.", normalizeNumber "1.", "1")
+  , ("normalizeNumber 1E+07", normalizeNumber "1E+07", "1e7")
+  , ("normalizeNumber 1e-07", normalizeNumber "1e-07", "1e-7")
+  , ("normalizeNumber 1e0", normalizeNumber "1e0", "1")
+  , ("normalizeNumber 0XFF", normalizeNumber "0XFF", "0xff")
+  , ("decode 'a\\nb'", decodeStringLiteral "'a\\nb'", "a\nb")
+  , ("decode '\\u0041'", decodeStringLiteral "'\\u0041'", "A")
+  , ("decode '\\x41'", decodeStringLiteral "'\\x41'", "A")
+  , ("decode '\\u{1F600}'", decodeStringLiteral "'\\u{1F600}'", "😀")
+  , ("decode surrogate pair", decodeStringLiteral "'\\ud83d\\ude00'", "😀")
+  , ("encode a\\nb", encodeStringLiteral "a\nb", "\"a\\nb\"")
+  , ("encode with double quotes", encodeStringLiteral "say \"hi\"", "'say \"hi\"'")
+  , ("encode with single quotes", encodeStringLiteral "it's", "\"it's\"")
+  , ("encode both quotes", encodeStringLiteral "'\"", "\"\'\\\"\"")
   ]
-
-/-! ## The `[js| ... |end_js]` syntax
-
-The fragment is parsed while this file is elaborated; the value below is the
-tree, not the text. -/
 
 def embedded : MiniProgram :=
   [js| function greet(name) {
@@ -203,20 +153,41 @@ def embedded : MiniProgram :=
 
 def embeddedExpr : MiniExpr := [js_expr| a + b * (c - d) |end_js]
 
-def testMiniElab : List Test :=
-  [ shouldBe "[js| ... |end_js] prints in the canonical style" (printProgram embedded)
-      ("function greet(name) {\n  if (name) {\n    console.log(`hello ${name}`);\n  } else"
-        ++ " console.log(\"hi\");\n}\nconst xs = [1, 2, 3].map((x) => x * 2);\n")
-  , shouldBe "[js| ... |end_js] agrees with the parser"
-      (toString (match parse "function greet(name) { if (name) { console.log(`hello ${name}`) } else console.log('hi'); } const xs = [1,2,3].map(x => x*2);" with
+def spec : Spec := do
+  describe "MiniAST Print Layout" do
+    for (label, actual, expected) in printCases do
+      it label do
+        shouldEqual actual expected
+
+  describe "MiniAST Determinism" do
+    for (label, actual, expected) in determinismCases do
+      it label do
+        shouldEqual actual expected
+
+  describe "MiniAST Round Trip" do
+    for s in roundTripSources do
+      it ("print: " ++ s) do
+        shouldEqual (miniStable s) "true"
+      it ("toAST: " ++ s) do
+        shouldEqual (miniViaAST s) "true"
+      it ("render: " ++ s) do
+        shouldEqual (miniViaASTSource s) "true"
+
+  describe "MiniAST Literals" do
+    for (label, actual, expected) in literalCases do
+      it label do
+        shouldEqual actual expected
+
+  describe "MiniAST Elab" do
+    it "[js| ... |end_js] prints in the canonical style" do
+      shouldEqual (printProgram embedded)
+        ("function greet(name) {\n  if (name) {\n    console.log(`hello ${name}`);\n  } else"
+          ++ " console.log(\"hi\");\n}\nconst xs = [1, 2, 3].map((x) => x * 2);\n")
+    it "[js| ... |end_js] agrees with the parser" do
+      shouldEqual (toString (match parse "function greet(name) { if (name) { console.log(`hello ${name}`) } else console.log('hi'); } const xs = [1,2,3].map(x => x*2);" with
         | .ok p => p == embedded
         | .error _ => false)) "true"
-  , shouldBe "[js_expr| ... |end_js]" (printExpr embeddedExpr) "a + b * (c - d)"
-  ]
+    it "[js_expr| ... |end_js]" do
+      shouldEqual (printExpr embeddedExpr) "a + b * (c - d)"
 
-def testMiniAST : List Test :=
-  testMiniPrint ++ testMiniDeterminism ++ testMiniRoundTrip ++ testMiniLiterals ++ testMiniElab
-
-#guard allPass testMiniAST
-
-end Test.Language.Javascript
+end LanguageJavascriptTests.Mini.AST
