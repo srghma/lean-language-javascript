@@ -10,6 +10,14 @@ name = "spec"
 git = "https://github.com/srghma/lean-spec.git"
 rev = "main"
 
+[[lean_lib]]
+name = "LanguageJavascriptTests"
+globs = ["LanguageJavascriptTests.+"]
+
+[[lean_lib]]
+name = "LanguageJavascriptBench"
+globs = ["LanguageJavascriptBench.+"]
+
 [[lean_exe]]
 name = "tests"
 root = "LanguageJavascriptTests.Main"
@@ -17,3 +25,4 @@ root = "LanguageJavascriptTests.Main"
 [[lean_exe]]
 name = "bench"
 root = "LanguageJavascriptBench.Main"
+

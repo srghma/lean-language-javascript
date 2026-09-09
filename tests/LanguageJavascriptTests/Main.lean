@@ -36,8 +36,20 @@ def main : IO UInt32 := do
   -- The one file-based test of the Haskell `ProgramParser` suite; it reads
   -- `test/Unicode.js` so it cannot be checked at compile time.
   total := total + 1
+  let unicodePath : System.FilePath ← do
+    let candidates : List System.FilePath := [
+      "./LanguageJavascriptTests/test/Unicode.js",
+      "./test/Unicode.js",
+      "tests/LanguageJavascriptTests/test/Unicode.js"
+    ]
+    let mut found : System.FilePath := "./LanguageJavascriptTests/test/Unicode.js"
+    for c in candidates do
+      if (← c.pathExists) then
+        found := c
+        break
+    pure found
   let good ← runIOTest "Program parser (utf8 file)"
-      (testFileUtf8 "./test/Unicode.js")
+      (testFileUtf8 unicodePath)
       "JSAstProgram [JSOpAssign ('=',JSIdentifier 'àáâãäå',JSDecimal '1'),JSSemicolon]"
   ok := ok && good
   -- A large generated source, run at run time only: it is far too big to be
