@@ -1,30 +1,54 @@
 /-
 Port of the Haskell test module `ModuleParser`.
 -/
-import LanguageJavascriptTests.Utils
+import Spec
+import LanguageJavascript.Parser
+import LanguageJavascript.AST
 
-namespace Test.Language.Javascript
+namespace LanguageJavascriptTests.ModuleParser
 
-def testModuleParser : List Test :=
+open Spec
+open Spec.Assert
+open LanguageJavaScript.Parser
+open LanguageJavaScript.Parser.AST
+
+def escapeLabel (s : String) : String :=
+  s.replace "\n" "\\n" |>.replace "\r" "\\r"
+
+def showStrippedMaybe : Except String JSAST → String
+  | .ok ast => "Right (" ++ showStripped ast ++ ")"
+  | .error e => "Left (\"" ++ e ++ "\")"
+
+def testModule (str : String) : String := showStrippedMaybe (parseModule str)
+
+def moduleCases : List (String × String) :=
   -- as
-  [ shouldBe "as" (testModule "as") "Right (JSAstModule [JSModuleStatementListItem (JSIdentifier 'as')])"
+  [ ("as", "Right (JSAstModule [JSModuleStatementListItem (JSIdentifier 'as')])")
   -- import
-  , shouldBe "import def from 'mod';" (testModule "import def from 'mod';") "Right (JSAstModule [JSModuleImportDeclaration (JSImportDeclaration (JSImportClauseDefault (JSIdentifier 'def'),JSFromClause ''mod''))])"
-  , shouldBe "import def from \"mod\";" (testModule "import def from \"mod\";") "Right (JSAstModule [JSModuleImportDeclaration (JSImportDeclaration (JSImportClauseDefault (JSIdentifier 'def'),JSFromClause '\"mod\"'))])"
-  , shouldBe "import * as thing from 'mod';" (testModule "import * as thing from 'mod';") "Right (JSAstModule [JSModuleImportDeclaration (JSImportDeclaration (JSImportClauseNameSpace (JSImportNameSpace (JSIdentifier 'thing')),JSFromClause ''mod''))])"
-  , shouldBe "import { foo, bar, baz as quux } from 'mod';" (testModule "import { foo, bar, baz as quux } from 'mod';") "Right (JSAstModule [JSModuleImportDeclaration (JSImportDeclaration (JSImportClauseNameSpace (JSImportsNamed ((JSImportSpecifier (JSIdentifier 'foo'),JSImportSpecifier (JSIdentifier 'bar'),JSImportSpecifierAs (JSIdentifier 'baz',JSIdentifier 'quux')))),JSFromClause ''mod''))])"
-  , shouldBe "import def, * as thing from 'mod';" (testModule "import def, * as thing from 'mod';") "Right (JSAstModule [JSModuleImportDeclaration (JSImportDeclaration (JSImportClauseDefaultNameSpace (JSIdentifier 'def',JSImportNameSpace (JSIdentifier 'thing')),JSFromClause ''mod''))])"
-  , shouldBe "import def, { foo, bar, baz as quux } from 'mod';" (testModule "import def, { foo, bar, baz as quux } from 'mod';") "Right (JSAstModule [JSModuleImportDeclaration (JSImportDeclaration (JSImportClauseDefaultNamed (JSIdentifier 'def',JSImportsNamed ((JSImportSpecifier (JSIdentifier 'foo'),JSImportSpecifier (JSIdentifier 'bar'),JSImportSpecifierAs (JSIdentifier 'baz',JSIdentifier 'quux')))),JSFromClause ''mod''))])"
+  , ("import def from 'mod';", "Right (JSAstModule [JSModuleImportDeclaration (JSImportDeclaration (JSImportClauseDefault (JSIdentifier 'def'),JSFromClause ''mod''))])")
+  , ("import def from \"mod\";", "Right (JSAstModule [JSModuleImportDeclaration (JSImportDeclaration (JSImportClauseDefault (JSIdentifier 'def'),JSFromClause '\"mod\"'))])")
+  , ("import * as thing from 'mod';", "Right (JSAstModule [JSModuleImportDeclaration (JSImportDeclaration (JSImportClauseNameSpace (JSImportNameSpace (JSIdentifier 'thing')),JSFromClause ''mod''))])")
+  , ("import { foo, bar, baz as quux } from 'mod';", "Right (JSAstModule [JSModuleImportDeclaration (JSImportDeclaration (JSImportClauseNameSpace (JSImportsNamed ((JSImportSpecifier (JSIdentifier 'foo'),JSImportSpecifier (JSIdentifier 'bar'),JSImportSpecifierAs (JSIdentifier 'baz',JSIdentifier 'quux')))),JSFromClause ''mod''))])")
+  , ("import def, * as thing from 'mod';", "Right (JSAstModule [JSModuleImportDeclaration (JSImportDeclaration (JSImportClauseDefaultNameSpace (JSIdentifier 'def',JSImportNameSpace (JSIdentifier 'thing')),JSFromClause ''mod''))])")
+  , ("import def, { foo, bar, baz as quux } from 'mod';", "Right (JSAstModule [JSModuleImportDeclaration (JSImportDeclaration (JSImportClauseDefaultNamed (JSIdentifier 'def',JSImportsNamed ((JSImportSpecifier (JSIdentifier 'foo'),JSImportSpecifier (JSIdentifier 'bar'),JSImportSpecifierAs (JSIdentifier 'baz',JSIdentifier 'quux')))),JSFromClause ''mod''))])")
   -- export
-  , shouldBe "export {}" (testModule "export {}") "Right (JSAstModule [JSModuleExportDeclaration (JSExportLocals (JSExportClause (())))])"
-  , shouldBe "export {};" (testModule "export {};") "Right (JSAstModule [JSModuleExportDeclaration (JSExportLocals (JSExportClause (())))])"
-  , shouldBe "export const a = 1;" (testModule "export const a = 1;") "Right (JSAstModule [JSModuleExportDeclaration (JSExport (JSConstant (JSVarInitExpression (JSIdentifier 'a') [JSDecimal '1'])))])"
-  , shouldBe "export function f() {};" (testModule "export function f() {};") "Right (JSAstModule [JSModuleExportDeclaration (JSExport (JSFunction 'f' () (JSBlock [])))])"
-  , shouldBe "export { a };" (testModule "export { a };") "Right (JSAstModule [JSModuleExportDeclaration (JSExportLocals (JSExportClause ((JSExportSpecifier (JSIdentifier 'a')))))])"
-  , shouldBe "export { a as b };" (testModule "export { a as b };") "Right (JSAstModule [JSModuleExportDeclaration (JSExportLocals (JSExportClause ((JSExportSpecifierAs (JSIdentifier 'a',JSIdentifier 'b')))))])"
-  , shouldBe "export {} from 'mod'" (testModule "export {} from 'mod'") "Right (JSAstModule [JSModuleExportDeclaration (JSExportFrom (JSExportClause (()),JSFromClause ''mod''))])"
+  , ("export {}", "Right (JSAstModule [JSModuleExportDeclaration (JSExportLocals (JSExportClause (())))])")
+  , ("export {};", "Right (JSAstModule [JSModuleExportDeclaration (JSExportLocals (JSExportClause (())))])")
+  , ("export const a = 1;", "Right (JSAstModule [JSModuleExportDeclaration (JSExport (JSConstant (JSVarInitExpression (JSIdentifier 'a') [JSDecimal '1'])))])")
+  , ("export function f() {};", "Right (JSAstModule [JSModuleExportDeclaration (JSExport (JSFunction 'f' () (JSBlock [])))])")
+  , ("export { a };", "Right (JSAstModule [JSModuleExportDeclaration (JSExportLocals (JSExportClause ((JSExportSpecifier (JSIdentifier 'a')))))])")
+  , ("export { a as b };", "Right (JSAstModule [JSModuleExportDeclaration (JSExportLocals (JSExportClause ((JSExportSpecifierAs (JSIdentifier 'a',JSIdentifier 'b')))))])")
+  , ("export {} from 'mod'", "Right (JSAstModule [JSModuleExportDeclaration (JSExportFrom (JSExportClause (()),JSFromClause ''mod''))])")
   ]
 
-#guard allPass testModuleParser
+def spec : Spec := do
+  describe "Module parser" do
+    let mut seen : Std.HashSet String := {}
+    for (input, expected) in moduleCases do
+      let rawName := escapeLabel input
+      let name := if seen.contains rawName then s!"{rawName} (duplicate)" else rawName
+      seen := seen.insert rawName
+      it name do
+        shouldEqual (testModule input) expected
 
-end Test.Language.Javascript
+end LanguageJavascriptTests.ModuleParser

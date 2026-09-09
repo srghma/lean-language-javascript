@@ -1,20 +1,16 @@
 /-
-A large input test.  There is no such test in the Haskell suite; it is here
-to check that the lexer and the parser stay usable on realistically sized
-sources: everything below runs on a source of a few hundred kilobytes, which
-only completes quickly if the lexer's cost is proportional to the size of the
-input (and not, say, to its square).
-
-The test is a correctness test, not a timing one: it checks that a large
-generated program parses, that printing the parse tree reproduces the source
-character for character, and that minifying it produces the expected number
-of statements.
+A large input test.
 -/
-import LanguageJavascriptTests.Utils
+import Spec
+import LanguageJavascript.Parser
+import LanguageJavascript.Printer
+import LanguageJavascript.Minify
 import LanguageJavascriptBench.SampleSource
 
-namespace Test.Language.Javascript
+namespace LanguageJavascriptTests.Scaling
 
+open Spec
+open Spec.Assert
 open LanguageJavaScript.Parser
 open LanguageJavaScript.Parser.AST
 open LanguageJavaScript.Pretty
@@ -45,4 +41,9 @@ trip, and a minified program that is shorter than the source. -/
 def scalingExpected : String :=
   s!"{scalingChunks} statements, round trip ok, minified smaller"
 
-end Test.Language.Javascript
+def spec : Spec := do
+  describe "Large input" do
+    it "1000 chunks" do
+      shouldEqual scalingReport scalingExpected
+
+end LanguageJavascriptTests.Scaling
