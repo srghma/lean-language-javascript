@@ -1,0 +1,14 @@
+name = "LanguageJavascript"
+defaultTargets = ["LanguageJavascript"]
+
+[[lean_lib]]
+name = "LanguageJavascript"
+globs = ["LanguageJavascript.+"]
+
+[[lean_exe]]
+name = "tests"
+root = "LanguageJavascriptTests.Main"
+
+[[lean_exe]]
+name = "bench"
+root = "LanguageJavascriptBench.Main"

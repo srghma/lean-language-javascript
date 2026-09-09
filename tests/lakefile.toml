@@ -1,0 +1,19 @@
+name = "LanguageJavascriptTests"
+testDriver = "tests"
+
+[[require]]
+name = "LanguageJavascript"
+path = "../lib"
+
+[[require]]
+name = "spec"
+git = "https://github.com/srghma/lean-spec.git"
+rev = "main"
+
+[[lean_exe]]
+name = "tests"
+root = "LanguageJavascriptTests.Main"
+
+[[lean_exe]]
+name = "bench"
+root = "LanguageJavascriptBench.Main"
