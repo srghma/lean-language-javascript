@@ -417,190 +417,119 @@ instance {c m : Nat} : Inhabited (ModuleItem c m 0 0) := ⟨.stmt default⟩
 instance {c m : Nat} : Inhabited (ModuleItems c m) := ⟨.nil⟩
 instance : Inhabited Program := ⟨⟨.nil⟩⟩
 
-/-! ## Lists
-
-The scope indexed lists are ordinary lists in disguise; these are the
-conversions. -/
+/-! ## Lists -/
 
 namespace Exprs
-
-/-- The elements, as a list. -/
 def toList {c m : Nat} : Exprs c m → List (Expr c m)
   | .nil => []
   | .cons e r => e :: toList r
-
-/-- The list, as an `Exprs`. -/
 def ofList {c m : Nat} : List (Expr c m) → Exprs c m
   | [] => .nil
   | e :: r => .cons e (ofList r)
-
 @[simp] theorem toList_ofList {c m : Nat} (l : List (Expr c m)) : (ofList l).toList = l := by
   induction l with
   | nil => rfl
   | cons a l ih => simp [ofList, toList, ih]
-
 end Exprs
 
 namespace ArrayElems
-
-/-- The elements, as a list. -/
 def toList {c m : Nat} : ArrayElems c m → List (ArrayElem c m)
   | .nil => []
   | .cons e r => e :: toList r
-
-/-- The list, as an `ArrayElems`. -/
 def ofList {c m : Nat} : List (ArrayElem c m) → ArrayElems c m
   | [] => .nil
   | e :: r => .cons e (ofList r)
-
-@[simp] theorem toList_ofList {c m : Nat} (l : List (ArrayElem c m)) :
-    (ofList l).toList = l := by
+@[simp] theorem toList_ofList {c m : Nat} (l : List (ArrayElem c m)) : (ofList l).toList = l := by
   induction l with
   | nil => rfl
   | cons a l ih => simp [ofList, toList, ih]
-
 end ArrayElems
 
 namespace TemplateParts
-
-/-- The parts, as a list. -/
 def toList {c m : Nat} : TemplateParts c m → List (TemplatePart c m)
   | .nil => []
   | .cons e r => e :: toList r
-
-/-- The list, as a `TemplateParts`. -/
 def ofList {c m : Nat} : List (TemplatePart c m) → TemplateParts c m
   | [] => .nil
   | e :: r => .cons e (ofList r)
-
 end TemplateParts
 
 namespace Properties
-
-/-- The properties, as a list. -/
 def toList {c m : Nat} : Properties c m → List (Property c m)
   | .nil => []
   | .cons e r => e :: toList r
-
-/-- The list, as a `Properties`. -/
 def ofList {c m : Nat} : List (Property c m) → Properties c m
   | [] => .nil
   | e :: r => .cons e (ofList r)
-
 end Properties
 
 namespace ClassElems
-
-/-- The members, as a list. -/
 def toList {c m : Nat} : ClassElems c m → List (ClassElem c m)
   | .nil => []
   | .cons e r => e :: toList r
-
-/-- The list, as a `ClassElems`. -/
 def ofList {c m : Nat} : List (ClassElem c m) → ClassElems c m
   | [] => .nil
   | e :: r => .cons e (ofList r)
-
 end ClassElems
 
 namespace SwitchCases
-
-/-- The cases, as a list. -/
 def toList {c m : Nat} : SwitchCases c m → List (SwitchCase c m)
   | .nil => []
   | .cons e r => e :: toList r
-
-/-- The list, as a `SwitchCases`. -/
 def ofList {c m : Nat} : List (SwitchCase c m) → SwitchCases c m
   | [] => .nil
   | e :: r => .cons e (ofList r)
-
 end SwitchCases
 
 namespace ExportLocals
-
-/-- The entries, as a list. -/
 def toList {c m : Nat} : ExportLocals c m → List (ExportLocal c m)
   | .nil => []
   | .cons e r => e :: toList r
-
-/-- The list, as an `ExportLocals`. -/
 def ofList {c m : Nat} : List (ExportLocal c m) → ExportLocals c m
   | [] => .nil
   | e :: r => .cons e (ofList r)
-
 end ExportLocals
 
 namespace OptExpr
-
-/-- The expression, if there is one. -/
 def toOption {c m : Nat} : OptExpr c m → Option (Expr c m)
   | OptExpr.none => Option.none
   | OptExpr.some e => Option.some e
-
-/-- The option, as an `OptExpr`. -/
 def ofOption {c m : Nat} : Option (Expr c m) → OptExpr c m
   | Option.none => OptExpr.none
   | Option.some e => OptExpr.some e
-
 end OptExpr
 
 namespace OptBlock
-
-/-- The block, if there is one. -/
 def toOption {c m : Nat} : OptBlock c m → Option (Block c m)
   | OptBlock.none => Option.none
   | OptBlock.some b => Option.some b
-
-/-- The option, as an `OptBlock`. -/
 def ofOption {c m : Nat} : Option (Block c m) → OptBlock c m
   | Option.none => OptBlock.none
   | Option.some b => OptBlock.some b
-
 end OptBlock
 
-/-! ## Casting along an equality of scopes
+/-! ## Casting along an equality of scopes -/
 
-The scope of a node is a piece of arithmetic, and two arithmetically equal
-scopes are not always *definitionally* equal, so these move a node between
-them. -/
-
-/-- Move an expression to an equal scope. -/
 def Expr.castScope {c c' m m' : Nat} (hc : c = c') (hm : m = m') (e : Expr c m) : Expr c' m' :=
   hc ▸ hm ▸ e
 
-/-- Move an optional expression to an equal scope. -/
-def OptExpr.castScope {c c' m m' : Nat} (hc : c = c') (hm : m = m') (e : OptExpr c m) :
-    OptExpr c' m' := hc ▸ hm ▸ e
+def OptExpr.castScope {c c' m m' : Nat} (hc : c = c') (hm : m = m') (e : OptExpr c m) : OptExpr c' m' :=
+  hc ▸ hm ▸ e
 
-/-- Move a block to an equal scope. -/
-def Block.castScope {c c' m m' : Nat} (hc : c = c') (hm : m = m') (b : Block c m) :
-    Block c' m' := hc ▸ hm ▸ b
+def Block.castScope {c c' m m' : Nat} (hc : c = c') (hm : m = m') (b : Block c m) : Block c' m' :=
+  hc ▸ hm ▸ b
 
-/-! ## Names of the variables
+def ModuleItems.castScope {c c' m m' : Nat} (hc : c = c') (hm : m = m') (b : ModuleItems c m) : ModuleItems c' m' :=
+  hc ▸ hm ▸ b
 
-A de Bruijn *index* counts from the innermost binder, so the same variable
-has a different index at different depths.  What does not change is its
-*level*, the number of binders of its kind that were already in scope when
-it was bound; `constName`/`mutName` therefore generate the names of the
-printed program from the level, so that a variable is spelled the same way
-wherever it is mentioned. -/
+/-! ## Names of the variables -/
 
-/-- The level of the const variable of index `i` in a scope with `c` const
-variables: `constLevel i = c - 1 - i`. -/
 def constLevel {c : Nat} (i : Fin c) : Nat := c - 1 - i.val
-
-/-- The level of the mutable variable of index `i` in a scope with `m`
-mutable variables. -/
 def mutLevel {m : Nat} (i : Fin m) : Nat := m - 1 - i.val
 
-/-- The index, in a scope with `c` const variables, of the const variable of
-level `l`; `none` if the level is not in scope. -/
 def constIndex? (c l : Nat) : Option (Fin c) :=
   if h : l < c then some ⟨c - 1 - l, by omega⟩ else none
 
-/-- The index, in a scope with `m` mutable variables, of the mutable
-variable of level `l`; `none` if the level is not in scope. -/
 def mutIndex? (m l : Nat) : Option (Fin m) :=
   if h : l < m then some ⟨m - 1 - l, by omega⟩ else none
 
@@ -618,10 +547,22 @@ def mutIndex? (m l : Nat) : Option (Fin m) :=
   rw [dif_pos (by omega)]
   exact congrArg some (Fin.ext (by simp; omega))
 
-/-- The generated name of the const variable of level `l`. -/
 def constName (l : Nat) : NEString := ⟨"_c" ++ toString l, by simp⟩
-
-/-- The generated name of the mutable variable of level `l`. -/
 def mutName (l : Nat) : NEString := ⟨"_m" ++ toString l, by simp⟩
+
+/-! ### Index based names -/
+
+def idxConstName (i : Nat) : NEString := ⟨"c#" ++ toString i, by simp⟩
+def idxMutName (i : Nat) : NEString := ⟨"l#" ++ toString i, by simp⟩
+def idxConstIdent (i : Nat) : NEString := ⟨"_brujinConst_" ++ toString i, by simp⟩
+def idxMutIdent (i : Nat) : NEString := ⟨"_brujinMut_" ++ toString i, by simp⟩
+
+def idxIdent? (n : NEString) : Option (Bool × Nat) :=
+  let s := n.val
+  if s.startsWith "_brujinConst_" then
+    ((s.drop "_brujinConst_".length).toNat?).map fun i => (true, i)
+  else if s.startsWith "_brujinMut_" then
+    ((s.drop "_brujinMut_".length).toNat?).map fun i => (false, i)
+  else none
 
 end Language.JavaScript.BrujinAST
