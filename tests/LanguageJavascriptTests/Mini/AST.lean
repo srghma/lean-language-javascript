@@ -51,13 +51,18 @@ def miniViaASTSource (src : String) : String :=
       toString (match parse (renderViaAST p) with | .ok q => q == p | .error _ => false)
   | .error e => "ERROR: " ++ e
 
+/-! ## The printed layout -/
+
 def printCases : List (String × String × String) :=
   [ ("var x = 1", miniPrint "var x = 1", "var x = 1;\n")
+    -- the layout of the input is not preserved
   , ("import  def  from 'mod'", miniPrint "import  def  from 'mod'", "import def from \"mod\";\n")
   , ("function f(a,b){return a+b*2}", miniPrint "function f(a,b){return a+b*2}", "function f(a, b) {\n  return a + b * 2;\n}\n")
   , ("if(x){f(1,2)}else{f(3,4)}", miniPrint "if(x){f(1,2)}else{f(3,4)}", "if (x) {\n  f(1, 2);\n} else {\n  f(3, 4);\n}\n")
   , ("if (a) b(); else c();", miniPrint "if (a) b(); else c();", "if (a) b();\nelse c();\n")
   , ("const o={a:1,'b b':2,[c]:3};", miniPrint "const o={a:1,'b b':2,[c]:3};", "const o = { a: 1, \"b b\": 2, [c]: 3 };\n")
+    -- a construct which does not fit into 80 columns is broken, one entry
+    -- per line, with a trailing comma
   , ("long object literal", miniPrint "const big={alpha:1,beta:2,gamma:3,delta:4,epsilon:5,zeta:66666,eta:77777,theta:8};", "const big = {\n  alpha: 1,\n  beta: 2,\n  gamma: 3,\n  delta: 4,\n  epsilon: 5,\n  zeta: 66666,\n  eta: 77777,\n  theta: 8,\n};\n")
   , ("let arr=[1,,2,];", miniPrint "let arr=[1,,2,];", "let arr = [1, , 2];\n")
   , ("class", miniPrint "class A extends B{constructor(x){super(x)}static c(){}*g(){yield 1}get v(){return 1}}", "class A extends B {\n  constructor(x) {\n    super(x);\n  }\n  static c() {}\n  *g() {\n    yield 1;\n  }\n  get v() {\n    return 1;\n  }\n}\n")
@@ -67,15 +72,23 @@ def printCases : List (String × String × String) :=
   , ("for(;;);", miniPrint "for(;;);", "for (;;);\n")
   , ("do{x++}while(x<3);", miniPrint "do{x++}while(x<3);", "do {\n  x++;\n} while (x < 3);\n")
   , ("label:while(1){break label}", miniPrint "label:while(1){break label}", "label: while (1) {\n  break label;\n}\n")
+    -- parentheses are not stored; they are put back where they are needed
   , ("x=(a+b)*c;y=a+(b*c);z=-(-1);", miniPrint "x=(a+b)*c;y=a+(b*c);z=-(-1);", "x = (a + b) * c;\ny = a + b * c;\nz = -(-1);\n")
   , ("let g=x=>({y:1});(function(){})();", miniPrint "let g=x=>({y:1});(function(){})();", "let g = (x) => ({ y: 1 });\n(function () {})();\n")
+    -- literals are normalised
   , ("literals", miniPrint "let s=`a${b}c`;let r=/ab+/gi;let n=0XFF;let m=1.50;let q=.5e+07;", "let s = `a${b}c`;\nlet r = /ab+/gi;\nlet n = 0xff;\nlet m = 1.5;\nlet q = 0.5e7;\n")
   , ("quotes", miniPrint "x = 'it\'s';y=\"say \"hi\"\";z='\\u0041\\n';", "x = \"it's\";\ny = 'say \"hi\"';\nz = \"A\\n\";\n")
   , ("export {a as b} from 'm';export const x=1;", miniPrint "export {a as b} from 'm';export const x=1;", "export { a as b } from \"m\";\nexport const x = 1;\n")
   , ("f(...args);function g(a,...rest){}", miniPrint "f(...args);function g(a,...rest){}", "f(...args);\nfunction g(a, ...rest) {}\n")
   , ("a.b.c(1)[2].d;new Foo;new a.b(1);", miniPrint "a.b.c(1)[2].d;new Foo;new a.b(1);", "a.b.c(1)[2].d;\nnew Foo();\nnew a.b(1);\n")
+    -- an empty program prints as nothing
   , ("(empty)", miniPrint "", "")
   ]
+
+/-! ## Determinism
+
+Sources that differ only in what the deterministic AST does not record give
+equal trees. -/
 
 def determinismCases : List (String × String × String) :=
   [ ("whitespace", miniSame "var  x   =  1 ;" "var x = 1;", "true")
@@ -89,10 +102,13 @@ def determinismCases : List (String × String × String) :=
   , ("hex case", miniSame "x = 0XFF" "x = 0xff", "true")
   , ("redundant parentheses", miniSame "x = (((1)));" "x = 1;", "true")
   , ("new without arguments", miniSame "new Foo" "new Foo()", "true")
+    -- but a real difference is still a difference
   , ("different parentheses", miniSame "x = (a+b)*c" "x = a+b*c", "false")
   , ("different names", miniSame "var x = 1" "var y = 1", "false")
   , ("different strings", miniSame "x = 'a'" "x = 'b'", "false")
   ]
+
+/-! ## Round trips -/
 
 def roundTripSources : List String :=
   [ "var x = 1, y = 2;"
@@ -124,6 +140,8 @@ def roundTripSources : List String :=
   , "async function f() { await g() }"
   ]
 
+/-! ## Literals -/
+
 def literalCases : List (String × String × String) :=
   [ ("normalizeNumber 1.50", normalizeNumber "1.50", "1.5")
   , ("normalizeNumber 1.00", normalizeNumber "1.00", "1.0")
@@ -143,6 +161,11 @@ def literalCases : List (String × String × String) :=
   , ("encode with single quotes", encodeStringLiteral "it's", "\"it's\"")
   , ("encode both quotes", encodeStringLiteral "'\"", "\"\'\\\"\"")
   ]
+
+/-! ## The `[js| ... |end_js]` syntax
+
+The fragment is parsed while this file is elaborated; the value below is the
+tree, not the text. -/
 
 def embedded : MiniProgram :=
   [js| function greet(name) {
