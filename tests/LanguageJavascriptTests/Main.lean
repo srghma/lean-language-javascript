@@ -21,8 +21,8 @@ def spec : Spec := do
   LanguageJavascriptTests.RoundTrip.spec
   LanguageJavascriptTests.Minify.spec
   LanguageJavascriptTests.Scaling.spec
-  , ("Deterministic AST (MiniAST)", testMiniAST)
-  , ("Scope safe AST (BrujinAST)", testBrujinAST)
+  LanguageJavascriptTests.Mini.AST.spec
+  LanguageJavascriptTests.Brujin.AST.spec
 
 def main (args : List String) : IO UInt32 := do
   runSpecFromArgsAndReturnExitCode args spec

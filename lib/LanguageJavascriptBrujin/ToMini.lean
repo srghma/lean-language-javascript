@@ -20,8 +20,8 @@ there.  It is what gives `BrujinAST` its printer (`printProgram`) and its
 equality (`BEq`, comparing the canonical renderings: two trees are equal
 exactly when they are equal up to the names, which is α-equivalence).
 -/
-import RequestProject.JavaScript.BrujinAST
-import RequestProject.JavaScript.MiniASTPrinter
+import LanguageJavascriptBrujin.AST
+import LanguageJavascriptMini.Printer
 
 namespace Language.JavaScript.BrujinAST
 
