@@ -36,16 +36,20 @@ def brujinStable (src : String) : String :=
       toString (match parse (printProgram p) with | .ok q => q == p | .error _ => false)
   | .error e => "ERROR: " ++ e
 
+/-! ## What the conversion resolves -/
+
 def resolveCases : List (String × String × String) :=
   [ ("const, let, a function and a global",
       brujinRender
         "const a = 1; let b = a + 2; function f(x, y) { return x + y + a; } console.log(f(a, b));",
       ("const _c0 = 1;\nlet _m0 = _c0 + 2;\nfunction _c1(_m1, _m2) {\n"
         ++ "  return _m1 + _m2 + _c0;\n}\nconsole.log(_c1(_c0, _m0));\n"))
+    -- the binder of `for (const ...)` is a const, that of `for (let ...)` a mutable cell
   , ("the two kinds of for binder",
       brujinRender "for (const x of xs) { total += x; } for (let i = 0; i < 10; i++) { g(i); }",
       ("for (const _c0 of xs) {\n  total += _c0;\n}\nfor (let _m0 = 0; _m0 < 10; _m0++) {\n"
         ++ "  g(_m0);\n}\n"))
+    -- an imported name is a const binding, and so is a class declaration
   , ("an import binds const variables",
       brujinRender "import def, { a as b } from 'mod'; export { def }; export const q = b;",
       "import _c0, { a as _c1 } from \"mod\";\nexport { _c0 as def };\nexport const _c2 = _c1;\n")
@@ -56,9 +60,11 @@ def resolveCases : List (String × String × String) :=
       brujinRender "export { a as b } from 'm';", "export { a as b } from \"m\";\n")
   , ("an exported mutable binding",
       brujinRender "let x = 1; export { x };", "let _m0 = 1;\nexport { _m0 as x };\n")
+    -- the binder of a catch clause is a mutable cell
   , ("try/catch/finally",
       brujinRender "try { f() } catch (e) { console.log(e) } finally { done() }",
       ("try {\n  f();\n} catch (_m0) {\n  console.log(_m0);\n} finally {\n  done();\n}\n"))
+    -- a class is in scope in its own body, an object shorthand loses its name
   , ("a class and an object literal",
       brujinRender
         "class C extends D { m(a) { return new C(a); } } const o = { x, y: 2, m(z) { return z } };",
@@ -76,6 +82,7 @@ def resolveCases : List (String × String × String) :=
   , ("a named function expression",
       brujinRender "const f = function g(n) { return n < 2 ? 1 : n * g(n - 1); };",
       ("const _c0 = function _c0(_m0) {\n  return _m0 < 2 ? 1 : _m0 * _c0(_m0 - 1);\n};\n"))
+    -- there is no hoisting: a name used before its declaration is a global
   , ("no hoisting: a use before the declaration is an unsafeGlobal",
       brujinRender "g(); function g() {}", "g();\nfunction _c0() {}\n")
   , ("a declaration of several variables is split",
@@ -110,6 +117,12 @@ def resolveCases : List (String × String × String) :=
   , ("throw", brujinRender "throw new Error('x');", "throw new Error(\"x\");\n")
   ]
 
+/-! ## The conversion is faithful
+
+Reading the printed program back has to give the very same tree — which,
+since the names are generated from the tree, is exactly the statement that
+no scope information was lost. -/
+
 def brujinStableSources : List String :=
   [ "const a = 1; let b = a + 2; function f(x, y) { return x + y + a; } console.log(f(a, b));"
   , "for (const x of xs) { total += x; } for (let i = 0; i < 10; i++) { g(i); }"
@@ -138,6 +151,8 @@ def brujinStableSources : List String :=
   , "function* gen(a, b) { yield a; yield* b; }"
   ]
 
+/-! ## What the scope safe AST rules out -/
+
 def errorCases : List (String × String × String) :=
   [ ("assignment to a const variable", brujinRender "const c = 1; c = 2;",
       "ERROR: BrujinAST: assignment to the const variable c")
@@ -155,11 +170,24 @@ def errorCases : List (String × String × String) :=
       "ERROR: BrujinAST: a labelled statement that declares a variable")
   ]
 
+/-! ## Trees written by hand
+
+A `BrujinAST` value is written directly, without going through source; the
+type of a variable is what keeps it in scope. -/
+
+/-- `(x) => x`, in the empty scope. -/
 def identityFn : Expr 0 0 := .arrow 1 (.expr (.mutVar 0))
+
+/-- `(x, y) => x + y`: the *first* parameter is the *last* index. -/
 def plusFn : Expr 0 0 := .arrow 2 (.expr (.binary (.mutVar 1) .plus (.mutVar 0)))
+
+/-- An expression that mentions the two variables of its scope and a
+global; it only typechecks in a scope with a const and a mutable one. -/
 def usesBoth : Expr 1 1 :=
   .call (.unsafeGlobal ⟨"print", by decide⟩)
     (.cons (.binary (.constVar 0) .plus (.mutVar 0)) .nil)
+
+/-- `const x = 1; print(x);` -/
 def tinyProgram : Program :=
   ⟨.cons (.stmt (.constDecl (.number ⟨"1", by decide⟩)))
     (.cons (.stmt (.expr (.call (.unsafeGlobal ⟨"print", by decide⟩)
