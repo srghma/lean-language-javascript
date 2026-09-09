@@ -1,25 +1,5 @@
 /-
 Conversion of the deterministic `MiniAST` into the scope safe `BrujinAST`.
-
-This is the interesting direction: `MiniAST` talks about variables by name,
-`BrujinAST` by de Bruijn index into one of its two scopes, so the
-conversion is a scope check.  It keeps an environment of the bindings that
-are in scope, remembering for each of them its name, whether it is a const
-or a mutable binding, and its *level* — the number of bindings of its kind
-that were in scope where it was bound.  The index of a variable at a given
-depth is then computed from its level (`constIndex?`, `mutIndex?`).
-
-A name that the environment does not know is not an error: it becomes
-`Expr.unsafeGlobal`, the escape hatch.  That covers the globals
-(`console`, `Math`, …) and also a function of the same file that is used
-before the statement which declares it — `BrujinAST` has no hoisting.
-
-What *is* an error is a program the target cannot describe: a destructuring
-pattern or a default value in a binder, `with`, an assignment to a `const`
-variable, a `catch` with a guard or with several clauses, and a `for` whose
-first clause declares more than one variable.  A `var`/`let`/`const`
-statement with several declarators is not an error: it is split into one
-statement per declarator first, and empty statements are dropped.
 -/
 import LanguageJavascriptBrujin.AST
 import LanguageJavascriptMini.OfFull
@@ -28,141 +8,130 @@ namespace Language.JavaScript.BrujinAST
 
 open Language.JavaScript.MiniAST
 
-/-! ## The environment -/
-
-/-- One binding that is in scope. -/
 structure Binding where
-  /-- The name it was written with in the `MiniAST` tree. -/
   name : NEString
-  /-- Whether it is a const binding (as opposed to a mutable one). -/
   isConst : Bool
-  /-- Its level: the number of bindings of its kind that were already in
-  scope where it was bound. -/
   level : Nat
 deriving Repr, Inhabited
 
-/-- The bindings in scope, most recently bound first. -/
 abbrev Env := List Binding
 
 namespace Env
 
-/-- The innermost binding of `n`, if there is one. -/
 def lookup (env : Env) (n : NEString) : Option Binding :=
   env.find? fun b => b.name.val == n.val
 
-/-- Add `names`, bound left to right as const bindings, to a scope that had
-`c` const bindings. -/
 def pushConsts (env : Env) (c : Nat) (names : List NEString) : Env :=
   (names.zipIdx.map fun (n, j) => ⟨n, true, c + j⟩).reverse ++ env
 
-/-- Add `names`, bound left to right as mutable bindings, to a scope that
-had `m` mutable bindings. -/
 def pushMuts (env : Env) (m : Nat) (names : List NEString) : Env :=
   (names.zipIdx.map fun (n, j) => ⟨n, false, m + j⟩).reverse ++ env
 
 end Env
 
-/-- The result of a conversion: the node, or a message. -/
 abbrev ConvM := Except String
 
-/-- Report a program that `BrujinAST` cannot describe. -/
 def fail (msg : String) : ConvM α := .error ("BrujinAST: " ++ msg)
 
-/-! ## Resolving a name -/
+def resolveVar (env : Env) (c m : Nat) (n : NEString) : ConvM (Expr c m) :=
+  match idxIdent? n with
+  | some (true, i) =>
+      if h : i < c then pure (.constVar ⟨i, h⟩)
+      else fail s!"the de Bruijn index c#{i} is out of range: {c} const bindings are in scope"
+  | some (false, i) =>
+      if h : i < m then pure (.mutVar ⟨i, h⟩)
+      else fail s!"the de Bruijn index l#{i} is out of range: {m} mutable bindings are in scope"
+  | none =>
+    match env.lookup n with
+    | none => pure (.unsafeGlobal n)
+    | some b =>
+        if b.isConst then
+          match constIndex? c b.level with
+          | some i => pure (.constVar i)
+          | none => pure (.unsafeGlobal n)
+        else
+          match mutIndex? m b.level with
+          | some i => pure (.mutVar i)
+          | none => pure (.unsafeGlobal n)
 
-/-- The expression a name denotes: the variable it is bound to, or
-`unsafeGlobal` if it is not bound. -/
-def resolveVar (env : Env) (c m : Nat) (n : NEString) : Expr c m :=
-  match env.lookup n with
-  | none => .unsafeGlobal n
-  | some b =>
-      if b.isConst then
-        match constIndex? c b.level with
-        | some i => .constVar i
-        | none => .unsafeGlobal n
-      else
-        match mutIndex? m b.level with
-        | some i => .mutVar i
-        | none => .unsafeGlobal n
-
-/-- The assignment target a name denotes.  Assigning to a const binding is
-an error — that is what `const` means. -/
 def resolveTarget (env : Env) (c m : Nat) (n : NEString) : ConvM (Target c m) :=
-  match env.lookup n with
-  | none => pure (.unsafeGlobal n)
-  | some b =>
-      if b.isConst then
-        fail s!"assignment to the const variable {n.val}"
-      else
-        match mutIndex? m b.level with
-        | some i => pure (.mut i)
-        | none => pure (.unsafeGlobal n)
+  match idxIdent? n with
+  | some (true, i) => fail s!"assignment to the const variable c#{i}"
+  | some (false, i) =>
+      if h : i < m then pure (.mut ⟨i, h⟩)
+      else fail s!"the de Bruijn index l#{i} is out of range: {m} mutable bindings are in scope"
+  | none =>
+    match env.lookup n with
+    | none => pure (.unsafeGlobal n)
+    | some b =>
+        if b.isConst then
+          fail s!"assignment to the const variable {n.val}"
+        else
+          match mutIndex? m b.level with
+          | some i => pure (.mut i)
+          | none => pure (.unsafeGlobal n)
 
-/-- The name a binder is written with; a destructuring pattern or a default
-value is not supported. -/
+def resolveExportLocal (env : Env) (c m : Nat) (n exported : NEString) :
+    ConvM (ExportLocal c m) :=
+  match idxIdent? n with
+  | some (true, i) =>
+      if h : i < c then pure (.const ⟨i, h⟩ exported)
+      else fail s!"the de Bruijn index c#{i} is out of range: {c} const bindings are in scope"
+  | some (false, i) =>
+      if h : i < m then pure (.mut ⟨i, h⟩ exported)
+      else fail s!"the de Bruijn index l#{i} is out of range: {m} mutable bindings are in scope"
+  | none =>
+    match env.lookup n with
+    | none => fail s!"export of the unbound name {n.val}"
+    | some b =>
+        if b.isConst then
+          match constIndex? c b.level with
+          | some i => pure (.const i exported)
+          | none => fail s!"export of the out of scope name {n.val}"
+        else
+          match mutIndex? m b.level with
+          | some i => pure (.mut i exported)
+          | none => fail s!"export of the out of scope name {n.val}"
+
 def binderName : MiniExpr → ConvM NEString
   | .ident n => pure n
   | .array _ | .object _ => fail "a destructuring pattern in a binder"
   | .assign _ _ _ => fail "a default value in a binder"
   | _ => fail "a binder that is not a name"
 
-/-- The names of a parameter list. -/
 def paramNamesOf (params : List MiniExpr) : ConvM (List NEString) :=
   params.mapM binderName
 
-/-! ## Splitting declarations
-
-A statement of `BrujinAST` binds at most one variable, so a declaration
-with several declarators is split first; an empty statement is dropped. -/
-
-/-- Split a `var`/`let`/`const` statement into one statement per
-declarator, and drop an empty statement. -/
 def splitDecl : MiniStatement → List MiniStatement
   | .empty => []
   | .decl kind decls => decls.toList.map fun d => .decl kind ⟨d, []⟩
   | s => [s]
 
-/-- Split every declaration of a list of statements. -/
 def expandStmts (l : List MiniStatement) : List MiniStatement := l.flatMap splitDecl
 
-/-- Split every declaration of a list of top level items. -/
 def expandItems (items : List MiniModuleItem) : List MiniModuleItem :=
   items.flatMap fun
     | .stmt s => (splitDecl s).map .stmt
     | .exportDecl (.decl s) => (splitDecl s).map fun s => .exportDecl (.decl s)
     | it => [it]
 
-/-! ## The conversion -/
-
-/-- A converted statement: how many const and mutable bindings it adds, the
-statement itself, and the bindings it adds, in binding order. -/
 structure StmtRes (c m : Nat) where
-  /-- The number of const bindings the statement adds. -/
   dc : Nat
-  /-- The number of mutable bindings the statement adds. -/
   dm : Nat
-  /-- The statement. -/
   stmt : Stmt c m dc dm
-  /-- The bindings it adds, in binding order. -/
   binds : List Binding
 
-/-- A converted top level item. -/
 structure ItemRes (c m : Nat) where
-  /-- The number of const bindings the item adds. -/
   dc : Nat
-  /-- The number of mutable bindings the item adds. -/
   dm : Nat
-  /-- The item. -/
   item : ModuleItem c m dc dm
-  /-- The bindings it adds, in binding order. -/
   binds : List Binding
 
 mutual
 
-/-- Convert an expression. -/
 partial def ofExpr (env : Env) (c m : Nat) (e : MiniExpr) : ConvM (Expr c m) := do
   match e with
-  | .ident n => pure (resolveVar env c m n)
+  | .ident n => resolveVar env c m n
   | .number raw => pure (.number raw)
   | .string v => pure (.string v)
   | .regex raw => pure (.regex raw)
@@ -218,12 +187,10 @@ partial def ofExpr (env : Env) (c m : Nat) (e : MiniExpr) : ConvM (Expr c m) := 
   | .yield x => pure (.yield (← ofOptExpr env c m x))
   | .yieldFrom x => pure (.yieldFrom (← ofExpr env c m x))
 
-/-- Convert an optional expression. -/
 partial def ofOptExpr (env : Env) (c m : Nat) : Option MiniExpr → ConvM (OptExpr c m)
   | none => pure .none
   | some e => do pure (.some (← ofExpr env c m e))
 
-/-- Convert the left hand side of an assignment or of an increment. -/
 partial def ofTarget (env : Env) (c m : Nat) (e : MiniExpr) : ConvM (Target c m) := do
   match e with
   | .ident n => resolveTarget env c m n
@@ -231,64 +198,51 @@ partial def ofTarget (env : Env) (c m : Nat) (e : MiniExpr) : ConvM (Target c m)
   | .index o i => pure (.index (← ofExpr env c m o) (← ofExpr env c m i))
   | _ => fail "an assignment target that is not a variable or a member"
 
-/-- Convert an element of an array literal. -/
 partial def ofArrayElem (env : Env) (c m : Nat) : MiniArrayElement → ConvM (ArrayElem c m)
   | .hole => pure .hole
   | .elem e => do pure (.elem (← ofExpr env c m e))
 
-/-- Convert the name of a property. -/
 partial def ofPropName (env : Env) (c m : Nat) : MiniPropertyName → ConvM (PropName c m)
   | .ident n => pure (.ident n)
   | .string v => pure (.string v)
   | .number raw => pure (.number raw)
   | .computed e => do pure (.computed (← ofExpr env c m e))
 
-/-- Convert a member of an object literal.  Shorthand `{x}` becomes the
-key/value pair `{x: x}`, with the variable resolved. -/
 partial def ofProperty (env : Env) (c m : Nat) : MiniProperty → ConvM (Property c m)
   | .keyValue k v => do pure (.keyValue (← ofPropName env c m k) (← ofExpr env c m v))
-  | .shorthand n => pure (.keyValue (.ident n) (resolveVar env c m n))
+  | .shorthand n => do pure (.keyValue (.ident n) (← resolveVar env c m n))
   | .method kind k params body => do
       let ps ← paramNamesOf params
       pure (.method kind (← ofPropName env c m k) ps.length
         (← ofBlock (env.pushMuts m ps) c (m + ps.length) body))
 
-/-- Convert a member of a class body. -/
 partial def ofClassElem (env : Env) (c m : Nat) (el : MiniClassElement) :
     ConvM (ClassElem c m) := do
   let ps ← paramNamesOf el.params
   pure (.mk el.isStatic el.kind (← ofPropName env c m el.key) ps.length
     (← ofBlock (env.pushMuts m ps) c (m + ps.length) el.body))
 
-/-- Convert the members of a class body. -/
 partial def ofClassElems (env : Env) (c m : Nat) (els : List MiniClassElement) :
     ConvM (ClassElems c m) := do
   pure (ClassElems.ofList (← els.mapM (ofClassElem env c m)))
 
-/-- Convert one case of a `switch`. -/
 partial def ofSwitchCase (env : Env) (c m : Nat) : MiniSwitchCase → ConvM (SwitchCase c m)
   | .case t b => do pure (.case (← ofExpr env c m t) (← ofBlock env c m b))
   | .default b => do pure (.default (← ofBlock env c m b))
 
-/-- Convert the body of a statement, which is a block if it is written as
-one and a one statement block otherwise. -/
 partial def ofBody (env : Env) (c m : Nat) : MiniStatement → ConvM (Block c m)
   | .block b => ofBlock env c m b
   | .empty => pure .nil
   | s => ofBlock env c m [s]
 
-/-- Convert an optional body. -/
 partial def ofOptBody (env : Env) (c m : Nat) : Option MiniStatement → ConvM (OptBlock c m)
   | none => pure .none
   | some s => do pure (.some (← ofBody env c m s))
 
-/-- Convert a list of statements into a block. -/
 partial def ofBlock (env : Env) (c m : Nat) (stmts : List MiniStatement) :
     ConvM (Block c m) :=
   ofStmts env c m (expandStmts stmts)
 
-/-- Convert a list of statements in which the declarations have already
-been split. -/
 partial def ofStmts (env : Env) (c m : Nat) : List MiniStatement → ConvM (Block c m)
   | [] => pure .nil
   | s :: rest => do
@@ -296,7 +250,6 @@ partial def ofStmts (env : Env) (c m : Nat) : List MiniStatement → ConvM (Bloc
       let tl ← ofStmts (r.binds.reverse ++ env) (c + r.dc) (m + r.dm) rest
       pure (.cons r.stmt tl)
 
-/-- Convert a `for (... in ...)` or `for (... of ...)` statement. -/
 partial def ofForInOf (env : Env) (c m : Nat) (isOf : Bool) (head : MiniForHead)
     (obj : MiniExpr) (body : MiniStatement) : ConvM (StmtRes c m) := do
   let obj' ← ofExpr env c m obj
@@ -315,7 +268,6 @@ partial def ofForInOf (env : Env) (c m : Nat) (isOf : Bool) (head : MiniForHead)
           let b ← ofBody (env.pushMuts m [n]) c (m + 1) body
           return ⟨0, 0, if isOf then .forOf .letBind obj' b else .forIn .letBind obj' b, []⟩
 
-/-- Convert a `for (;;)` statement. -/
 partial def ofForC (env : Env) (c m : Nat) (init : MiniForInit) (cond step : Option MiniExpr)
     (body : MiniStatement) : ConvM (StmtRes c m) := do
   match init with
@@ -347,7 +299,6 @@ partial def ofForC (env : Env) (c m : Nat) (init : MiniForInit) (cond step : Opt
             return ⟨0, 0, .for_ (.letDecl i') (← ofOptExpr inner c (m + 1) cond)
               (← ofOptExpr inner c (m + 1) step) (← ofBody inner c (m + 1) body), []⟩
 
-/-- Convert a statement. -/
 partial def ofStmt (env : Env) (c m : Nat) (s : MiniStatement) : ConvM (StmtRes c m) := do
   match s with
   | .expr e => return ⟨0, 0, .expr (← ofExpr env c m e), []⟩
@@ -417,9 +368,6 @@ partial def ofStmt (env : Env) (c m : Nat) (s : MiniStatement) : ConvM (StmtRes 
 
 end
 
-/-! ## Modules -/
-
-/-- Convert a top level item. -/
 def ofModuleItem (env : Env) (c m : Nat) : MiniModuleItem → ConvM (ItemRes c m)
   | .stmt s => do
       let r ← ofStmt env c m s
@@ -437,26 +385,13 @@ def ofModuleItem (env : Env) (c m : Nat) : MiniModuleItem → ConvM (ItemRes c m
             locals.zipIdx.map fun (n, j) => ⟨n, true, c + j⟩⟩
   | .exportDecl (.fromClause specs mod) => pure ⟨0, 0, .exportFrom specs mod, []⟩
   | .exportDecl (.locals specs) => do
-      let entries ← specs.mapM fun sp => do
-        let exported := sp.alias_.getD sp.name
-        match env.lookup sp.name with
-        | none => fail s!"export of the unbound name {sp.name.val}"
-        | some b =>
-            if b.isConst then
-              match constIndex? c b.level with
-              | some i => pure (ExportLocal.const i exported)
-              | none => fail s!"export of the out of scope name {sp.name.val}"
-            else
-              match mutIndex? m b.level with
-              | some i => pure (ExportLocal.mut i exported)
-              | none => fail s!"export of the out of scope name {sp.name.val}"
+      let entries ← specs.mapM fun sp =>
+        resolveExportLocal env c m sp.name (sp.alias_.getD sp.name)
       return ⟨0, 0, .exportLocals (ExportLocals.ofList entries), []⟩
   | .exportDecl (.decl s) => do
       let r ← ofStmt env c m s
       return ⟨r.dc, r.dm, .exportDecl r.stmt, r.binds⟩
 
-/-- Convert a list of top level items in which the declarations have
-already been split. -/
 partial def ofItems (env : Env) (c m : Nat) : List MiniModuleItem → ConvM (ModuleItems c m)
   | [] => pure .nil
   | it :: rest => do
@@ -464,12 +399,92 @@ partial def ofItems (env : Env) (c m : Nat) : List MiniModuleItem → ConvM (Mod
       let tl ← ofItems (r.binds.reverse ++ env) (c + r.dc) (m + r.dm) rest
       pure (.cons r.item tl)
 
-/-- Convert a whole `MiniAST` program into a scope safe one. -/
 def ofMiniProgram (p : MiniProgram) : ConvM Program := do
   pure ⟨← ofItems [] 0 0 (expandItems p.items)⟩
 
-/-- Read JavaScript source into a `BrujinAST` program. -/
 def parse (input : String) : ConvM Program := do
   ofMiniProgram (← MiniAST.parse input)
+
+def isIdentChar (ch : Char) : Bool := ch.isAlphanum || ch == '_' || ch == '$'
+
+inductive ScanMode where
+  | code
+  | subst (depth : Nat)
+  | string (delim : Char)
+  | template
+  | lineComment
+  | blockComment
+deriving Repr, DecidableEq, Inhabited
+
+partial def rewriteAux (stack : List ScanMode) (prev : Char) (cs : List Char) (acc : String) :
+    String :=
+  match cs with
+  | [] => acc
+  | ch :: rest =>
+    match stack with
+    | [] => acc ++ String.ofList cs
+    | .string d :: st =>
+        if ch == '\\' then
+          match rest with
+          | [] => acc.push ch
+          | e :: more => rewriteAux stack e more ((acc.push ch).push e)
+        else if ch == d then rewriteAux st ch rest (acc.push ch)
+        else rewriteAux stack ch rest (acc.push ch)
+    | .template :: st =>
+        if ch == '\\' then
+          match rest with
+          | [] => acc.push ch
+          | e :: more => rewriteAux stack e more ((acc.push ch).push e)
+        else if ch == '`' then rewriteAux st ch rest (acc.push ch)
+        else if ch == '$' && rest.head? == some '{' then
+          rewriteAux (.subst 0 :: stack) ' ' (rest.drop 1) ((acc.push ch).push '{')
+        else rewriteAux stack ch rest (acc.push ch)
+    | .lineComment :: st =>
+        if ch == '\n' then rewriteAux st ch rest (acc.push ch)
+        else rewriteAux stack ch rest (acc.push ch)
+    | .blockComment :: st =>
+        if prev == '*' && ch == '/' then rewriteAux st ch rest (acc.push ch)
+        else rewriteAux stack ch rest (acc.push ch)
+    | m :: st =>
+        if (ch == 'c' || ch == 'l') && !isIdentChar prev then
+          match rest with
+          | '#' :: more =>
+              let ds := more.takeWhile Char.isDigit
+              if ds.isEmpty then rewriteAux stack ch rest (acc.push ch)
+              else
+                let i := (String.ofList ds).toNat!
+                let name := if ch == 'c' then (idxConstIdent i).val else (idxMutIdent i).val
+                rewriteAux stack '0' (more.drop ds.length) (acc ++ name)
+          | _ => rewriteAux stack ch rest (acc.push ch)
+        else if ch == '"' || ch == '\'' then
+          rewriteAux (.string ch :: stack) ch rest (acc.push ch)
+        else if ch == '`' then rewriteAux (.template :: stack) ch rest (acc.push ch)
+        else if ch == '/' && rest.head? == some '/' then
+          rewriteAux (.lineComment :: stack) ' ' (rest.drop 1) ((acc.push ch).push '/')
+        else if ch == '/' && rest.head? == some '*' then
+          rewriteAux (.blockComment :: stack) ' ' (rest.drop 1) ((acc.push ch).push '*')
+        else
+          match m with
+          | .subst d =>
+              if ch == '{' then rewriteAux (.subst (d + 1) :: st) ch rest (acc.push ch)
+              else if ch == '}' then
+                if d == 0 then rewriteAux st ch rest (acc.push ch)
+                else rewriteAux (.subst (d - 1) :: st) ch rest (acc.push ch)
+              else rewriteAux stack ch rest (acc.push ch)
+          | _ => rewriteAux stack ch rest (acc.push ch)
+
+def rewriteIndexRefs (input : String) : String :=
+  rewriteAux [.code] ' ' input.toList ""
+
+def parseIndexed (input : String) : ConvM Program :=
+  parse (rewriteIndexRefs input)
+
+def parseIndexed! (input : String) : Program := (parseIndexed input).toOption.getD default
+
+def parseExprIndexed (c m : Nat) (input : String) : ConvM (Expr c m) := do
+  ofExpr [] c m (← MiniAST.parseExpr (rewriteIndexRefs input))
+
+def parseExprIndexed! (c m : Nat) (input : String) : Expr c m :=
+  (parseExprIndexed c m input).toOption.getD default
 
 end Language.JavaScript.BrujinAST
