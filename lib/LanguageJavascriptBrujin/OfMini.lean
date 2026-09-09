@@ -21,8 +21,8 @@ first clause declares more than one variable.  A `var`/`let`/`const`
 statement with several declarators is not an error: it is split into one
 statement per declarator first, and empty statements are dropped.
 -/
-import RequestProject.JavaScript.BrujinAST
-import RequestProject.JavaScript.MiniASTOfAST
+import LanguageJavascriptBrujin.AST
+import LanguageJavascriptMini.OfFull
 
 namespace Language.JavaScript.BrujinAST
 

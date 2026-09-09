@@ -56,7 +56,7 @@ a local variable.  Each of them is therefore its own inductive (`Exprs`,
 `Properties`, …) with `toList`/`ofList` functions next to it; `OptExpr` and
 `OptBlock` play the part of `Option` for the same reason.
 -/
-import RequestProject.JavaScript.MiniAST
+import LanguageJavascriptMini.AST
 
 namespace Language.JavaScript.BrujinAST
 
