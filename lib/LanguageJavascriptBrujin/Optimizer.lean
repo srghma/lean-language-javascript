@@ -773,9 +773,9 @@ def optModuleItems {c m : Nat} : ModuleItems exprExt targetExt c m → ModuleIte
               ModuleItems.castScope (by omega) (by omega) (optModuleItems r)
       | it => .cons (optModuleItem it) (optModuleItems r)
 
-/-- Optimize a program: one bottom up pass.  The optimizer never invents a
-global, so the set of globals of the result is the one of the input. -/
-def optimizeProgram (p : Program) : Program := ⟨p.globals, optModuleItems p.items⟩
+/-- Optimize a program: one bottom up pass. -/
+def optimizeProgram (p : ModuleItems exprExt targetExt 0 0) : ModuleItems exprExt targetExt 0 0 :=
+  optModuleItems p
 
 /-- Optimize an expression: one bottom up pass. -/
 def optimizeExpr {c m : Nat} (e : Expr exprExt targetExt c m) : Expr exprExt targetExt c m := optExpr e
@@ -786,7 +786,8 @@ def optimizeBlock {c m : Nat} (b : Block exprExt targetExt c m) : Block exprExt 
 /-- Optimize a program repeatedly, until a pass changes nothing or `fuel`
 passes have been run.  One pass already folds bottom up, so this only helps
 where a rewrite creates a new opportunity above it. -/
-def optimizeProgramFix (fuel : Nat) (p : Program) : Program :=
+def optimizeProgramFix [ExtPrinter exprExt targetExt] (fuel : Nat)
+    (p : ModuleItems exprExt targetExt 0 0) : ModuleItems exprExt targetExt 0 0 :=
   match fuel with
   | 0 => p
   | fuel + 1 =>

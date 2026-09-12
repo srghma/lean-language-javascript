@@ -30,3 +30,10 @@ name = "Regex"
 git = "https://github.com/pandaman64/lean-regex"
 rev = "main"
 subDir = "regex"
+
+[[require]]
+name = "NonEmpty"
+git = "https://github.com/srghma/lean-nonempty"
+rev = "main"
+# or if local
+# path = "/full/path/to/lean-nonempty"

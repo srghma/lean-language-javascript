@@ -44,7 +44,7 @@ def blen : List Char → Nat
 @[simp] theorem blen_append (l m : List Char) : blen (l ++ m) = blen l + blen m := by
   induction l with
   | nil => simp
-  | cons c cs ih => simp [-String.singleton.eq_1, ih, Nat.add_assoc]
+  | cons c cs ih => simp [ih, Nat.add_assoc]
 
 /-- A character takes at least one byte, so a list takes at least as many
 bytes as it has characters. -/
@@ -58,12 +58,12 @@ theorem length_le_blen (l : List Char) : l.length ≤ blen l := by
 
 theorem blen_ofList (l : List Char) : blen l = (String.ofList l).utf8ByteSize := by
   induction l with
-  | nil => simp [-String.singleton.eq_1, String.ofList_nil]
+  | nil => simp [String.ofList_nil]
   | cons c cs ih =>
     have hsplit : String.ofList (c :: cs) = String.ofList [c] ++ String.ofList cs := by
       rw [← String.ofList_append]; rfl
     have hone : (String.ofList [c]).utf8ByteSize = c.utf8Size := by
-      rw [← String.singleton_eq_ofList]; simp [-String.singleton.eq_1, String.singleton]
+      rw [← String.singleton_eq_ofList]; simp only [String.utf8ByteSize_singleton]
     rw [blen_cons, ih, hsplit, String.utf8ByteSize_append, hone]
 
 /-- The bytes of a string are the bytes of its characters. -/
@@ -74,7 +74,7 @@ theorem utf8GetAux_append (c : Char) (suf : List Char) : ∀ (pre : List Char) (
     String.Pos.Raw.utf8GetAux (pre ++ c :: suf) ⟨i⟩ ⟨i + blen pre⟩ = c := by
   intro pre
   induction pre with
-  | nil => intro i; simp [-String.singleton.eq_1, String.Pos.Raw.utf8GetAux]
+  | nil => intro i; simp [String.Pos.Raw.utf8GetAux]
   | cons d ds ih =>
     intro i
     have hpos := d.utf8Size_pos
@@ -113,8 +113,8 @@ theorem extract_go₂ : ∀ (mid rest : List Char) (k : Nat),
   | nil =>
     intro rest k
     cases rest with
-    | nil => simp [-String.singleton.eq_1, String.Pos.Raw.extract.go₂]
-    | cons d ds => simp [-String.singleton.eq_1, String.Pos.Raw.extract.go₂]
+    | nil => simp [String.Pos.Raw.extract.go₂]
+    | cons d ds => simp [String.Pos.Raw.extract.go₂]
   | cons d ds ih =>
     intro rest k
     have hpos := d.utf8Size_pos
@@ -136,8 +136,8 @@ theorem extract_go₁ (e : String.Pos.Raw) : ∀ (pre rest : List Char) (k : Nat
   | nil =>
     intro rest k
     cases rest with
-    | nil => simp [-String.singleton.eq_1, String.Pos.Raw.extract.go₁, String.Pos.Raw.extract.go₂]
-    | cons d ds => simp [-String.singleton.eq_1, String.Pos.Raw.extract.go₁]
+    | nil => simp [String.Pos.Raw.extract.go₁, String.Pos.Raw.extract.go₂]
+    | cons d ds => simp [String.Pos.Raw.extract.go₁]
   | cons d ds ih =>
     intro rest k
     have hpos := d.utf8Size_pos
@@ -156,7 +156,7 @@ theorem extract_eq {s : String} {pre mid rest : List Char}
     (h : s.toList = pre ++ mid ++ rest) :
     String.Pos.Raw.extract s ⟨blen pre⟩ ⟨blen pre + blen mid⟩ = String.ofList mid := by
   cases mid with
-  | nil => simp [-String.singleton.eq_1, String.Pos.Raw.extract, String.ofList_nil]
+  | nil => simp [String.Pos.Raw.extract, String.ofList_nil]
   | cons d ds =>
     have hpos := d.utf8Size_pos
     have hlt : ¬ (blen pre + blen (d :: ds) ≤ blen pre) := by simp only [blen_cons]; omega
@@ -195,8 +195,8 @@ theorem scanFrom_eq (s : String) : ∀ (suf pre : List Char) (f : RegExpFlags) (
     have hstop : s.utf8ByteSize ≤ blen pre := by
       rw [← blen_toList s, hs]; simp
     cases fuel with
-    | zero => simp [-String.singleton.eq_1, scanFrom, readChars, hstop]
-    | succ n => simp [-String.singleton.eq_1, scanFrom, readChars, hstop]
+    | zero => simp [scanFrom, readChars, hstop]
+    | succ n => simp [scanFrom, readChars, hstop]
   | cons c cs ih =>
     intro pre f fuel hs hfuel
     have hsize : s.utf8ByteSize = blen pre + (c.utf8Size + blen cs) := by
@@ -277,7 +277,7 @@ theorem splitList?_eq : ∀ (cs : List Char) (inClass escaped : Bool) (pat rest 
     splitList? inClass escaped cs = some (pat, rest) → cs = pat ++ '/' :: rest := by
   intro cs
   induction cs with
-  | nil => intro inClass escaped pat rest h; simp [-String.singleton.eq_1, splitList?] at h
+  | nil => intro inClass escaped pat rest h; simp [splitList?] at h
   | cons c tl ih =>
     intro inClass escaped pat rest h
     -- every branch but the closing slash prepends `c` to the pattern
@@ -328,8 +328,8 @@ theorem scanClose_eq (raw : String) : ∀ (suf pre : List Char) (inClass escaped
     have hstop : raw.utf8ByteSize ≤ blen pre := by
       rw [← blen_toList raw, hs]; simp
     cases fuel with
-    | zero => simp [-String.singleton.eq_1, scanClose, splitList?]
-    | succ n => simp [-String.singleton.eq_1, scanClose, splitList?, hstop]
+    | zero => simp [scanClose, splitList?]
+    | succ n => simp [scanClose, splitList?, hstop]
   | cons c cs ih =>
     intro pre inClass escaped fuel hs hfuel
     have hsize : raw.utf8ByteSize = blen pre + (c.utf8Size + blen cs) := by
@@ -395,19 +395,19 @@ the list based one reads. -/
 theorem parse?_eq_parseList? (raw : String) : parse? raw = parseList? raw := by
   rcases hraw : raw.toList with _ | ⟨c, rest⟩
   · have hempty : raw.utf8ByteSize = 0 := by rw [← blen_toList raw, hraw]; rfl
-    simp [-String.singleton.eq_1, parse?, parseList?, hraw, hempty]
+    simp [parse?, parseList?, hraw, hempty]
   · have hpos := c.utf8Size_pos
     have hsize : raw.utf8ByteSize = c.utf8Size + blen rest := by
       rw [← blen_toList raw, hraw]; simp
     have hnz : (raw.utf8ByteSize == 0) = false := by
       have : raw.utf8ByteSize ≠ 0 := by omega
-      simp [-String.singleton.eq_1, this]
+      simp [this]
     have hget0' : String.Pos.Raw.get raw ⟨0⟩ = c := get_eq (pre := []) (by simpa using hraw)
     have hget0 : String.Pos.Raw.get raw 0 = c := hget0'
     by_cases hslash : c = '/'
     · subst hslash
       have hg : (raw.utf8ByteSize == 0 || String.Pos.Raw.get raw ⟨0⟩ != '/') = false := by
-        rw [hget0']; simp [-String.singleton.eq_1, hnz]
+        rw [hget0']; simp [hnz]
       have hone : ('/' : Char).utf8Size = 1 := by decide
       have hstart : (⟨1⟩ : String.Pos.Raw) = ⟨blen ['/']⟩ := rfl
       have hfuel : rest.length ≤ raw.utf8ByteSize := by
@@ -441,15 +441,15 @@ theorem parse?_eq_parseList? (raw : String) : parse? raw = parseList? raw := by
           (raw.utf8ByteSize - blen ('/' :: (pat ++ ['/']))) hlist2 hflagfuel
         simp only [Option.map_some, hextract, RegExpFlags.parseRange?, hbytepos, hflags]
         cases hsrc : NEString.ofString? (String.ofList pat) with
-        | none => simp [-String.singleton.eq_1, hsrc]
+        | none => simp [hsrc]
         | some src =>
           cases hfl : RegExpFlags.readChars {} flagChars with
-          | none => simp [-String.singleton.eq_1, hsrc, hfl]
-          | some fl => simp [-String.singleton.eq_1, hsrc, hfl]
+          | none => simp [hsrc, hfl]
+          | some fl => simp [hsrc, hfl]
     · have hg : (raw.utf8ByteSize == 0 || String.Pos.Raw.get raw ⟨0⟩ != '/') = true := by
-        rw [hget0']; simp [-String.singleton.eq_1, hslash]
+        rw [hget0']; simp [hslash]
       simp only [parse?, hg, ite_true]
-      simp [-String.singleton.eq_1, parseList?, hraw, hslash]
+      simp [parseList?, hraw, hslash]
 
 /-- The accumulator based splitter the literal used to be read with. -/
 def splitPatternAcc (acc : List Char) (inClass escaped : Bool) :
@@ -522,8 +522,8 @@ theorem parse?_eq_parseAcc? (raw : String) : parse? raw = parseAcc? raw := by
       simp only [splitPatternAcc_eq rest [] false false, List.reverse_nil, List.nil_append]
       cases splitList? false false rest with
       | none => rfl
-      | some r => simp [-String.singleton.eq_1, RegExpFlags.readChars_ofList]
-    · simp [-String.singleton.eq_1, hslash]
+      | some r => simp [RegExpFlags.readChars_ofList]
+    · simp [hslash]
 
 end RegExpLit
 

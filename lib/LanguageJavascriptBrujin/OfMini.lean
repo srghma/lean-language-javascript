@@ -6,12 +6,6 @@ import LanguageJavascriptMini.OfFull
 
 namespace Language.JavaScript.BrujinAST
 
--- The set of unknown globals a tree may mention: the conversion builds a
--- tree whose extension is `GlobalExt g`, the escape hatch being a name it
--- does not bind.  Every function here is generic in the set: none of them
--- invents a global, and none of them needs to know which ones there are.
-variable {g : Finset NEString}
-
 open Language.JavaScript.MiniAST
 
 structure Binding where
@@ -35,35 +29,40 @@ def pushMuts (env : Env) (m : Nat) (names : List NEString) : Env :=
 
 end Env
 
-/-- The result of the conversion.  It carries a set of names as state: the
-unknown globals the source mentions which are *not* in the target `g`.
+/-- Resolvers for free variable names and assignment targets encountered during conversion. -/
+structure Resolvers (exprExt targetExt : Nat → Nat → Type) where
+  /-- Resolve a free name in expression position into an extension node. -/
+  resolveFree : (c m : Nat) → NEString → Except String (exprExt c m)
+  /-- Resolve a free name in assignment target position into a target extension node. -/
+  resolveFreeTarget : (c m : Nat) → NEString → Except String (targetExt c m) :=
+    fun _ _ n => .error s!"assignment to unknown global: {n.val}"
 
-That is what makes the conversion possible at all.  A `BrujinAST` tree is
-indexed by the set of unknown globals it may mention, so the set has to be
-known before the tree is built; a first pass against the empty set records
-every free name it meets and puts a placeholder in the tree, and the second
-pass, run against the set the first one collected, builds the real tree and
-records nothing. -/
-abbrev ConvM := StateT (Finset NEString) (Except String)
+/-- The conversion monad, carrying the free identifier resolvers. -/
+abbrev ConvM (exprExt targetExt : Nat → Nat → Type) (α : Type) :=
+  ReaderT (Resolvers exprExt targetExt) (Except String) α
 
-/-- The result of a conversion which is not allowed to fail on a global. -/
+/-- The result of a conversion. -/
 abbrev ResM := Except String
 
-def fail (msg : String) : ConvM α := throw ("BrujinAST: " ++ msg)
+variable {exprExt targetExt : Nat → Nat → Type}
 
-/-- A name the tree does not bind: the escape hatch, which needs `n` to be
-one of the globals `g`.  When it is not, the name is recorded and a
-placeholder is returned — see `ConvM`. -/
-def freeName (n : NEString) : ConvM (Global.Expr c m g) :=
-  if h : n ∈ g then pure (.unsafeGlobal n h)
-  else do modify (insert n); pure .null
+def fail (msg : String) : ConvM exprExt targetExt α := throw ("BrujinAST: " ++ msg)
 
-/-- The same, for the left hand side of an assignment. -/
-def freeTarget (n : NEString) : ConvM (Global.Target c m g) :=
-  if h : n ∈ g then pure (.unsafeGlobal n h)
-  else do modify (insert n); pure (.dot .null n)
+/-- A name the tree does not bind: the escape hatch, resolved via `resolveFree`. -/
+def freeName (c m : Nat) (n : NEString) : ConvM exprExt targetExt (Expr exprExt targetExt c m) := do
+  let ctx ← read
+  match ctx.resolveFree c m n with
+  | .ok ext => pure (.unsafeExt ext)
+  | .error e => fail e
 
-def resolveVar (env : Env) (c m : Nat) (n : NEString) : ConvM (Global.Expr c m g) :=
+/-- The same, for the left hand side of an assignment: resolved via `resolveFreeTarget`. -/
+def freeTarget (c m : Nat) (n : NEString) : ConvM exprExt targetExt (Target exprExt targetExt c m) := do
+  let ctx ← read
+  match ctx.resolveFreeTarget c m n with
+  | .ok ext => pure (.unsafeExt ext)
+  | .error e => fail e
+
+def resolveVar (env : Env) (c m : Nat) (n : NEString) : ConvM exprExt targetExt (Expr exprExt targetExt c m) :=
   match idxIdent? n with
   | some (true, i) =>
       if h : i < c then pure (.constVar ⟨i, h⟩)
@@ -73,18 +72,18 @@ def resolveVar (env : Env) (c m : Nat) (n : NEString) : ConvM (Global.Expr c m g
       else fail s!"the de Bruijn index l#{i} is out of range: {m} mutable bindings are in scope"
   | none =>
     match env.lookup n with
-    | none => freeName n
+    | none => freeName c m n
     | some b =>
         if b.isConst then
           match constIndex? c b.level with
           | some i => pure (.constVar i)
-          | none => freeName n
+          | none => freeName c m n
         else
           match mutIndex? m b.level with
           | some i => pure (.mutVar i)
-          | none => freeName n
+          | none => freeName c m n
 
-def resolveTarget (env : Env) (c m : Nat) (n : NEString) : ConvM (Global.Target c m g) :=
+def resolveTarget (env : Env) (c m : Nat) (n : NEString) : ConvM exprExt targetExt (Target exprExt targetExt c m) :=
   match idxIdent? n with
   | some (true, i) => fail s!"assignment to the const variable c#{i}"
   | some (false, i) =>
@@ -92,17 +91,17 @@ def resolveTarget (env : Env) (c m : Nat) (n : NEString) : ConvM (Global.Target 
       else fail s!"the de Bruijn index l#{i} is out of range: {m} mutable bindings are in scope"
   | none =>
     match env.lookup n with
-    | none => freeTarget n
+    | none => freeTarget c m n
     | some b =>
         if b.isConst then
           fail s!"assignment to the const variable {n.val}"
         else
           match mutIndex? m b.level with
           | some i => pure (.mut i)
-          | none => freeTarget n
+          | none => freeTarget c m n
 
 def resolveExportLocal (env : Env) (c m : Nat) (n exported : NEString) :
-    ConvM (Global.ExportLocal c m g) :=
+    ConvM exprExt targetExt (ExportLocal exprExt targetExt c m) :=
   match idxIdent? n with
   | some (true, i) =>
       if h : i < c then pure (.const ⟨i, h⟩ exported)
@@ -125,7 +124,7 @@ def resolveExportLocal (env : Env) (c m : Nat) (n exported : NEString) :
 
 /-- The name a binding pattern binds.  `BrujinAST` has a binder for a plain
 name only, so a destructuring pattern and a default value are refused. -/
-def binderName : MiniPattern → ConvM NEString
+def binderName : MiniPattern → ConvM exprExt targetExt NEString
   | .ident n => pure n
   | .array _ | .object _ _ => fail "a destructuring pattern in a binder"
   | .withDefault _ _ => fail "a default value in a binder"
@@ -135,7 +134,7 @@ def binderName : MiniPattern → ConvM NEString
 only, so a default value and a destructuring pattern are refused; a rest
 parameter binds a name like any other, and the tree records that it is one.
 -/
-def paramBinderName : MiniParam → ConvM NEString
+def paramBinderName : MiniParam → ConvM exprExt targetExt NEString
   | .plain p | .rest p =>
     match p with
     | .ident n => pure n
@@ -163,7 +162,7 @@ def isRestParam : MiniParam → Bool
 
 /-- Read the parameters of a function.  A rest parameter is accepted where
 JavaScript allows one, which is nowhere but last. -/
-def paramsOf (params : List MiniParam) : ConvM ParamsRes := do
+def paramsOf (params : List MiniParam) : ConvM exprExt targetExt ParamsRes := do
   if params.dropLast.any isRestParam then
     fail "a rest parameter which is not the last one"
   else
@@ -178,16 +177,16 @@ def paramsOf (params : List MiniParam) : ConvM ParamsRes := do
         pure ⟨names.toList, params.length - 1, true, by simp; omega⟩
     | _ => pure ⟨names.toList, params.length, false, by simp⟩
 
-structure StmtRes (c m : Nat) (g : Finset NEString) where
+structure StmtRes (exprExt targetExt : Nat → Nat → Type) (c m : Nat) where
   dc : Nat
   dm : Nat
-  stmt : Global.Stmt c m g dc dm
+  stmt : Stmt exprExt targetExt c m dc dm
   binds : List Binding
 
-structure ItemRes (c m : Nat) (g : Finset NEString) where
+structure ItemRes (exprExt targetExt : Nat → Nat → Type) (c m : Nat) where
   dc : Nat
   dm : Nat
-  item : Global.ModuleItem c m g dc dm
+  item : ModuleItem exprExt targetExt c m dc dm
   binds : List Binding
 
 /-! ## Putting a declarator in front of what follows it
@@ -218,34 +217,34 @@ inductive DeclKind where
 deriving Repr, Inhabited
 
 /-- A `const` declarator in front of the rest of a block. -/
-def blockConsConst (c m : Nat) (init : Global.Expr c m g) (tl : Global.Block (c + 1) m g) : Global.Block c m g :=
+def blockConsConst (c m : Nat) (init : Expr exprExt targetExt c m) (tl : Block exprExt targetExt (c + 1) m) : Block exprExt targetExt c m :=
   .cons (.constDecl init) tl
 
 /-- A `using` declarator in front of the rest of a block. -/
-def blockConsUsing (c m : Nat) (isAwait : Bool) (init : Global.Expr c m g)
-    (tl : Global.Block (c + 1) m g) : Global.Block c m g :=
+def blockConsUsing (c m : Nat) (isAwait : Bool) (init : Expr exprExt targetExt c m)
+    (tl : Block exprExt targetExt (c + 1) m) : Block exprExt targetExt c m :=
   .cons (.usingDecl isAwait init) tl
 
 /-- A `let`/`var` declarator in front of the rest of a block. -/
-def blockConsLet (c m : Nat) (init : Global.OptExpr c m g) (tl : Global.Block c (m + 1) g) : Global.Block c m g :=
+def blockConsLet (c m : Nat) (init : OptExpr exprExt targetExt c m) (tl : Block exprExt targetExt c (m + 1)) : Block exprExt targetExt c m :=
   .cons (.letDecl init) tl
 
 /-- A `const` declarator in front of the rest of the top level; `exported`
 says whether it is written after an `export`. -/
-def itemsConsConst (exported : Bool) (c m : Nat) (init : Global.Expr c m g)
-    (tl : Global.ModuleItems (c + 1) m g) : Global.ModuleItems c m g :=
+def itemsConsConst (exported : Bool) (c m : Nat) (init : Expr exprExt targetExt c m)
+    (tl : ModuleItems exprExt targetExt (c + 1) m) : ModuleItems exprExt targetExt c m :=
   if exported then .cons (.exportDecl (.constDecl init)) tl
   else .cons (.stmt (.constDecl init)) tl
 
 /-- A `using` declarator in front of the rest of the top level. -/
-def itemsConsUsing (exported : Bool) (isAwait : Bool) (c m : Nat) (init : Global.Expr c m g)
-    (tl : Global.ModuleItems (c + 1) m g) : Global.ModuleItems c m g :=
+def itemsConsUsing (exported : Bool) (isAwait : Bool) (c m : Nat) (init : Expr exprExt targetExt c m)
+    (tl : ModuleItems exprExt targetExt (c + 1) m) : ModuleItems exprExt targetExt c m :=
   if exported then .cons (.exportDecl (.usingDecl isAwait init)) tl
   else .cons (.stmt (.usingDecl isAwait init)) tl
 
 /-- A `let`/`var` declarator in front of the rest of the top level. -/
-def itemsConsLet (exported : Bool) (c m : Nat) (init : Global.OptExpr c m g)
-    (tl : Global.ModuleItems c (m + 1) g) : Global.ModuleItems c m g :=
+def itemsConsLet (exported : Bool) (c m : Nat) (init : OptExpr exprExt targetExt c m)
+    (tl : ModuleItems exprExt targetExt c (m + 1)) : ModuleItems exprExt targetExt c m :=
   if exported then .cons (.exportDecl (.letDecl init)) tl
   else .cons (.stmt (.letDecl init)) tl
 
@@ -267,7 +266,7 @@ looking at, so passing it keeps every recursive call on a component. -/
 mutual
 
 /-- Convert an expression. -/
-def ofExpr (env : Env) (c m : Nat) (e : MiniExpr) : ConvM (Global.Expr c m g) := do
+def ofExpr (env : Env) (c m : Nat) (e : MiniExpr) : ConvM exprExt targetExt (Expr exprExt targetExt c m) := do
   match e with
   | .ident n => resolveVar env c m n
   | .number n => pure (.number n)
@@ -346,19 +345,19 @@ def ofExpr (env : Env) (c m : Nat) (e : MiniExpr) : ConvM (Global.Expr c m g) :=
 termination_by structural e
 
 /-- Convert an expression which may be absent. -/
-def ofOptExpr (env : Env) (c m : Nat) : Option MiniExpr → ConvM (Global.OptExpr c m g)
+def ofOptExpr (env : Env) (c m : Nat) : Option MiniExpr → ConvM exprExt targetExt (OptExpr exprExt targetExt c m)
   | none => pure .none
   | some e => do pure (.some (← ofExpr env c m e))
 termination_by structural x => x
 
 /-- Convert a list of expressions. -/
-def ofExprs (env : Env) (c m : Nat) : List MiniExpr → ConvM (Global.Exprs c m g)
+def ofExprs (env : Env) (c m : Nat) : List MiniExpr → ConvM exprExt targetExt (Exprs exprExt targetExt c m)
   | [] => pure .nil
   | e :: rest => do pure (.cons (← ofExpr env c m e) (← ofExprs env c m rest))
 termination_by structural x => x
 
 /-- Convert the left hand side of an assignment. -/
-def ofTarget (env : Env) (c m : Nat) (e : MiniExpr) : ConvM (Global.Target c m g) := do
+def ofTarget (env : Env) (c m : Nat) (e : MiniExpr) : ConvM exprExt targetExt (Target exprExt targetExt c m) := do
   match e with
   | .ident n => resolveTarget env c m n
   | .dot o n => pure (.dot (← ofExpr env c m o) n)
@@ -371,7 +370,7 @@ termination_by structural e
 /-- Convert the left hand side of an assignment written as a pattern.  A
 destructuring pattern and a default value are refused, so what is left is a
 name or a member access. -/
-def ofPatternTarget (env : Env) (c m : Nat) (p : MiniPattern) : ConvM (Global.Target c m g) := do
+def ofPatternTarget (env : Env) (c m : Nat) (p : MiniPattern) : ConvM exprExt targetExt (Target exprExt targetExt c m) := do
   match p with
   | .ident n => resolveTarget env c m n
   | .target e => ofTarget env c m e
@@ -380,7 +379,7 @@ def ofPatternTarget (env : Env) (c m : Nat) (p : MiniPattern) : ConvM (Global.Ta
 termination_by structural p
 
 /-- Convert one link of an optional chain. -/
-def ofChainLink (env : Env) (c m : Nat) : MiniChainLink → ConvM (Global.ChainLink c m g)
+def ofChainLink (env : Env) (c m : Nat) : MiniChainLink → ConvM exprExt targetExt (ChainLink exprExt targetExt c m)
   | .dot opt n => pure (.dot opt n)
   | .privateDot opt n => pure (.privateDot opt n)
   | .index opt i => do pure (.index opt (← ofExpr env c m i))
@@ -388,20 +387,20 @@ def ofChainLink (env : Env) (c m : Nat) : MiniChainLink → ConvM (Global.ChainL
 termination_by structural x => x
 
 /-- Convert the links of an optional chain. -/
-def ofChainLinks (env : Env) (c m : Nat) : List MiniChainLink → ConvM (Global.ChainLinks c m g)
+def ofChainLinks (env : Env) (c m : Nat) : List MiniChainLink → ConvM exprExt targetExt (ChainLinks exprExt targetExt c m)
   | [] => pure .nil
   | l :: rest => do
       pure (.cons (← ofChainLink env c m l) (← ofChainLinks env c m rest))
 termination_by structural x => x
 
 /-- Convert an element of an array literal. -/
-def ofArrayElem (env : Env) (c m : Nat) : MiniArrayElement → ConvM (Global.ArrayElem c m g)
+def ofArrayElem (env : Env) (c m : Nat) : MiniArrayElement → ConvM exprExt targetExt (ArrayElem exprExt targetExt c m)
   | .hole => pure .hole
   | .elem e => do pure (.elem (← ofExpr env c m e))
 termination_by structural x => x
 
 /-- Convert the elements of an array literal. -/
-def ofArrayElems (env : Env) (c m : Nat) : List MiniArrayElement → ConvM (Global.ArrayElems c m g)
+def ofArrayElems (env : Env) (c m : Nat) : List MiniArrayElement → ConvM exprExt targetExt (ArrayElems exprExt targetExt c m)
   | [] => pure .nil
   | el :: rest => do
       pure (.cons (← ofArrayElem env c m el) (← ofArrayElems env c m rest))
@@ -409,14 +408,14 @@ termination_by structural x => x
 
 /-- Convert the substitutions of a template literal. -/
 def ofTemplateParts (env : Env) (c m : Nat) :
-    List MiniTemplatePart → ConvM (Global.TemplateParts c m g)
+    List MiniTemplatePart → ConvM exprExt targetExt (TemplateParts exprExt targetExt c m)
   | [] => pure .nil
   | ⟨e, suffix⟩ :: rest => do
       pure (.cons (.mk (← ofExpr env c m e) suffix) (← ofTemplateParts env c m rest))
 termination_by structural x => x
 
 /-- Convert the name of a property. -/
-def ofPropName (env : Env) (c m : Nat) : MiniPropertyName → ConvM (Global.PropName c m g)
+def ofPropName (env : Env) (c m : Nat) : MiniPropertyName → ConvM exprExt targetExt (PropName exprExt targetExt c m)
   | .ident n => pure (.ident n)
   | .private_ n => pure (.private_ n)
   | .string v => pure (.string v)
@@ -425,7 +424,7 @@ def ofPropName (env : Env) (c m : Nat) : MiniPropertyName → ConvM (Global.Prop
 termination_by structural x => x
 
 /-- Convert a member of an object literal. -/
-def ofProperty (env : Env) (c m : Nat) : MiniProperty → ConvM (Global.Property c m g)
+def ofProperty (env : Env) (c m : Nat) : MiniProperty → ConvM exprExt targetExt (Property exprExt targetExt c m)
   | .keyValue k v => do pure (.keyValue (← ofPropName env c m k) (← ofExpr env c m v))
   | .shorthand n => do pure (.keyValue (.ident n) (← resolveVar env c m n))
   | .spread e => do pure (.spread (← ofExpr env c m e))
@@ -436,13 +435,13 @@ def ofProperty (env : Env) (c m : Nat) : MiniProperty → ConvM (Global.Property
 termination_by structural x => x
 
 /-- Convert the members of an object literal. -/
-def ofProperties (env : Env) (c m : Nat) : List MiniProperty → ConvM (Global.Properties c m g)
+def ofProperties (env : Env) (c m : Nat) : List MiniProperty → ConvM exprExt targetExt (Properties exprExt targetExt c m)
   | [] => pure .nil
   | p :: rest => do pure (.cons (← ofProperty env c m p) (← ofProperties env c m rest))
 termination_by structural x => x
 
 /-- Convert a member of a class body. -/
-def ofClassElem (env : Env) (c m : Nat) : MiniClassElement → ConvM (Global.ClassElem c m g)
+def ofClassElem (env : Env) (c m : Nat) : MiniClassElement → ConvM exprExt targetExt (ClassElem exprExt targetExt c m)
   | .method decorators isStatic kind key params body => do
       let ps ← paramsOf params
       pure (.method (← ofExprs env c m decorators) isStatic kind (← ofPropName env c m key)
@@ -456,21 +455,21 @@ termination_by structural x => x
 
 /-- Convert a class body. -/
 def ofClassElems (env : Env) (c m : Nat) :
-    List MiniClassElement → ConvM (Global.ClassElems c m g)
+    List MiniClassElement → ConvM exprExt targetExt (ClassElems exprExt targetExt c m)
   | [] => pure .nil
   | el :: rest => do
       pure (.cons (← ofClassElem env c m el) (← ofClassElems env c m rest))
 termination_by structural x => x
 
 /-- Convert one `case`/`default` of a `switch`. -/
-def ofSwitchCase (env : Env) (c m : Nat) : MiniSwitchCase → ConvM (Global.SwitchCase c m g)
+def ofSwitchCase (env : Env) (c m : Nat) : MiniSwitchCase → ConvM exprExt targetExt (SwitchCase exprExt targetExt c m)
   | .case t b => do pure (.case (← ofExpr env c m t) (← ofStmts env c m b))
   | .default b => do pure (.default (← ofStmts env c m b))
 termination_by structural x => x
 
 /-- Convert the cases of a `switch`. -/
 def ofSwitchCases (env : Env) (c m : Nat) :
-    List MiniSwitchCase → ConvM (Global.SwitchCases c m g)
+    List MiniSwitchCase → ConvM exprExt targetExt (SwitchCases exprExt targetExt c m)
   | [] => pure .nil
   | k :: rest => do
       pure (.cons (← ofSwitchCase env c m k) (← ofSwitchCases env c m rest))
@@ -479,7 +478,7 @@ termination_by structural x => x
 /-- Convert one declarator of a `var`/`let`/`const` inside a block, then
 whatever follows it, in the scope the declarator extends. -/
 def ofDeclThenBlock (kind : DeclKind) (d : MiniDeclarator) (env : Env) (c m : Nat)
-    (kont : (env : Env) → (c' m' : Nat) → ConvM (Global.Block c' m' g)) : ConvM (Global.Block c m g) :=
+    (kont : (env : Env) → (c' m' : Nat) → ConvM exprExt targetExt (Block exprExt targetExt c' m')) : ConvM exprExt targetExt (Block exprExt targetExt c m) :=
   match d with
   | ⟨lhs, init⟩ =>
       match kind with
@@ -513,7 +512,7 @@ termination_by structural d
 /-- Convert the remaining declarators of a `var`/`let`/`const` inside a
 block, then whatever follows them. -/
 def ofDeclsThenBlock (kind : DeclKind) (ds : List MiniDeclarator) (env : Env) (c m : Nat)
-    (kont : (env : Env) → (c' m' : Nat) → ConvM (Global.Block c' m' g)) : ConvM (Global.Block c m g) := do
+    (kont : (env : Env) → (c' m' : Nat) → ConvM exprExt targetExt (Block exprExt targetExt c' m')) : ConvM exprExt targetExt (Block exprExt targetExt c m) := do
   match ds with
   | [] => kont env c m
   | d :: ds =>
@@ -525,8 +524,8 @@ termination_by structural ds
 whatever follows it. -/
 def ofDeclThenItems (exported : Bool) (kind : DeclKind) (d : MiniDeclarator)
     (env : Env) (c m : Nat)
-    (kont : (env : Env) → (c' m' : Nat) → ConvM (Global.ModuleItems c' m' g)) :
-    ConvM (Global.ModuleItems c m g) := do
+    (kont : (env : Env) → (c' m' : Nat) → ConvM exprExt targetExt (ModuleItems exprExt targetExt c' m')) :
+    ConvM exprExt targetExt (ModuleItems exprExt targetExt c m) := do
   match d with
   | ⟨lhs, init⟩ =>
       let n ← binderName lhs
@@ -554,8 +553,8 @@ def ofDeclThenItems (exported : Bool) (kind : DeclKind) (d : MiniDeclarator)
 then whatever follows them. -/
 def ofDeclsThenItems (exported : Bool) (kind : DeclKind) (ds : List MiniDeclarator)
     (env : Env) (c m : Nat)
-    (kont : (env : Env) → (c' m' : Nat) → ConvM (Global.ModuleItems c' m' g)) :
-    ConvM (Global.ModuleItems c m g) := do
+    (kont : (env : Env) → (c' m' : Nat) → ConvM exprExt targetExt (ModuleItems exprExt targetExt c' m')) :
+    ConvM exprExt targetExt (ModuleItems exprExt targetExt c m) := do
   match ds with
   | [] => kont env c m
   | d :: ds =>
@@ -566,7 +565,7 @@ termination_by structural ds
 /-- Convert the statements of a block.  An empty statement disappears and a
 declaration of several variables becomes one statement per declarator, as
 in the deterministic tree's own reading of a block. -/
-def ofStmts (env : Env) (c m : Nat) : List MiniStatement → ConvM (Global.Block c m g)
+def ofStmts (env : Env) (c m : Nat) : List MiniStatement → ConvM exprExt targetExt (Block exprExt targetExt c m)
   | [] => pure .nil
   | .empty :: rest => ofStmts env c m rest
   | .decl kind ⟨d, ds⟩ :: rest =>
@@ -588,7 +587,7 @@ conversion of `s` as a statement, which only the last case needs; the
 caller passes it because `s` is a component of the node it is converting,
 so that this stays a recursion on components. -/
 def ofBody (env : Env) (c m : Nat) (s : MiniStatement)
-    (self : ConvM (StmtRes c m g)) : ConvM (Global.Block c m g) :=
+    (self : ConvM exprExt targetExt (StmtRes exprExt targetExt c m)) : ConvM exprExt targetExt (Block exprExt targetExt c m) :=
   match s with
   | .block b => ofStmts env c m b
   | .empty => pure .nil
@@ -604,7 +603,7 @@ def ofBody (env : Env) (c m : Nat) (s : MiniStatement)
 termination_by structural s
 
 /-- Convert a statement, together with what it binds. -/
-def ofStmt (env : Env) (c m : Nat) (s : MiniStatement) : ConvM (StmtRes c m g) := do
+def ofStmt (env : Env) (c m : Nat) (s : MiniStatement) : ConvM exprExt targetExt (StmtRes exprExt targetExt c m) := do
   match s with
   | .expr e => return ⟨0, 0, .expr (← ofExpr env c m e), []⟩
   | .empty => return ⟨0, 0, .block .nil, []⟩
@@ -631,7 +630,7 @@ def ofStmt (env : Env) (c m : Nat) (s : MiniStatement) : ConvM (StmtRes c m g) :
   | .if_ cond t e =>
       let cond' ← ofExpr env c m cond
       let tb ← ofBody env c m t (ofStmt env c m t)
-      let eb : Global.OptBlock c m g ←
+      let eb : OptBlock exprExt targetExt c m ←
         match e with
         | none => pure .none
         | some s => do pure (.some (← ofBody env c m s (ofStmt env c m s)))
@@ -743,7 +742,7 @@ def ofStmt (env : Env) (c m : Nat) (s : MiniStatement) : ConvM (StmtRes c m g) :
               | none =>
                   let n ← binderName param
                   let cb ← ofStmts (env.pushMuts m [n]) c (m + 1) cbody
-                  let f : Global.OptBlock c m g ←
+                  let f : OptBlock exprExt targetExt c m ←
                     match fin with
                     | .none => pure .none
                     | .some fb => do pure (.some (← ofStmts env c m fb))
@@ -752,7 +751,7 @@ def ofStmt (env : Env) (c m : Nat) (s : MiniStatement) : ConvM (StmtRes c m g) :
 termination_by structural s
 
 /-- Convert a top level item, together with what it binds. -/
-def ofModuleItem (env : Env) (c m : Nat) : MiniModuleItem → ConvM (ItemRes c m g)
+def ofModuleItem (env : Env) (c m : Nat) : MiniModuleItem → ConvM exprExt targetExt (ItemRes exprExt targetExt c m)
   | .stmt s => do
       let r ← ofStmt env c m s
       return ⟨r.dc, r.dm, .stmt r.stmt, r.binds⟩
@@ -782,7 +781,7 @@ def ofModuleItem (env : Env) (c m : Nat) : MiniModuleItem → ConvM (ItemRes c m
 /-- Convert the top level items.  As in a block, an empty statement
 disappears and a declaration of several variables — exported or not —
 becomes one item per declarator. -/
-def ofItems (env : Env) (c m : Nat) : List MiniModuleItem → ConvM (Global.ModuleItems c m g)
+def ofItems (env : Env) (c m : Nat) : List MiniModuleItem → ConvM exprExt targetExt (ModuleItems exprExt targetExt c m)
   | [] => pure .nil
   | .stmt .empty :: rest => ofItems env c m rest
   | .stmt (.decl kind ⟨d, ds⟩) :: rest =>
@@ -810,26 +809,48 @@ termination_by structural x => x
 
 end
 
-/-- The unknown globals `p` mentions: the names the first pass, run against
-the empty set, could not place. -/
-def freeGlobals (p : MiniProgram) : ResM (Finset NEString) := do
-  let (_, missing) ← (ofItems (g := (∅ : Finset NEString)) [] 0 0 p.items).run ∅
-  pure missing
+/-- Convert a `MiniProgram` with the given resolvers for free names and free targets. -/
+def ofMiniProgramWith (resolvers : Resolvers exprExt targetExt) (p : MiniProgram) :
+    ResM (ModuleItems exprExt targetExt 0 0) :=
+  (ofItems [] 0 0 p.items).run resolvers
 
-/-- Convert a `MiniProgram`, against a set of globals given in advance.  It
-fails if the program mentions an unknown global which is not in the set. -/
-def ofMiniProgramWith (globals : Finset NEString) (p : MiniProgram) : ResM Program := do
-  let (items, missing) ← (ofItems (g := globals) [] 0 0 p.items).run ∅
-  if missing = ∅ then pure ⟨globals, items⟩
-  else .error "BrujinAST: the program mentions unknown globals which are not in the given set"
+/-- Convert an expression with the given resolvers for free names and free targets. -/
+def ofExprWith (resolvers : Resolvers exprExt targetExt) (env : Env) (c m : Nat) (e : MiniExpr) :
+    ResM (Expr exprExt targetExt c m) :=
+  (ofExpr env c m e).run resolvers
 
-/-- Convert a `MiniProgram`, computing the set of unknown globals it
-mentions. -/
-def ofMiniProgram (p : MiniProgram) : ResM Program := do
-  ofMiniProgramWith (← freeGlobals p) p
+/-- Convert a `MiniProgram`, specifying resolving callbacks directly. -/
+def ofProgramWith
+    (resolveFree : (c m : Nat) → NEString → Except String (exprExt c m))
+    (resolveFreeTarget : (c m : Nat) → NEString → Except String (targetExt c m) :=
+      fun _ _ n => .error s!"assignment to unknown global: {n.val}")
+    (p : MiniProgram) :
+    ResM (ModuleItems exprExt targetExt 0 0) :=
+  ofMiniProgramWith ⟨resolveFree, resolveFreeTarget⟩ p
 
-def parse (input : String) : ResM Program := do
-  ofMiniProgram (← MiniAST.parse input)
+/-- Convert an expression, specifying resolving callbacks directly. -/
+def ofExprWithFns
+    (resolveFree : (c m : Nat) → NEString → Except String (exprExt c m))
+    (resolveFreeTarget : (c m : Nat) → NEString → Except String (targetExt c m) :=
+      fun _ _ n => .error s!"assignment to unknown global: {n.val}")
+    (env : Env) (c m : Nat) (e : MiniExpr) :
+    ResM (Expr exprExt targetExt c m) :=
+  ofExprWith ⟨resolveFree, resolveFreeTarget⟩ env c m e
+
+/-- Convert a closed `MiniProgram` (no free names or targets allowed). -/
+def ofMiniProgramClosed (p : MiniProgram) : ResM (ModuleItems NoExt NoExt 0 0) :=
+  ofMiniProgramWith ⟨fun _ _ n => .error s!"unknown global: {n.val}",
+                     fun _ _ n => .error s!"assignment to unknown global: {n.val}"⟩ p
+
+/-- Convert a closed expression (no free names or targets allowed). -/
+def ofExprClosed (env : Env) (c m : Nat) (e : MiniExpr) : ResM (Expr NoExt NoExt c m) :=
+  ofExprWith ⟨fun _ _ n => .error s!"unknown global: {n.val}",
+              fun _ _ n => .error s!"assignment to unknown global: {n.val}"⟩ env c m e
+
+/-- Parse a JavaScript program with custom resolvers. -/
+def parseWith (resolvers : Resolvers exprExt targetExt) (input : String) :
+    ResM (ModuleItems exprExt targetExt 0 0) := do
+  ofMiniProgramWith resolvers (← MiniAST.parse input)
 
 def isIdentChar (ch : Char) : Bool := ch.isAlphanum || ch == '_' || ch == '$'
 
@@ -958,21 +979,34 @@ decreasing_by
 def rewriteIndexRefs (input : String) : String :=
   rewriteAux input [.code] ' ' ⟨0⟩ ""
 
-def parseIndexed (input : String) : ResM Program :=
-  parse (rewriteIndexRefs input)
+/-- Default resolvers keeping free identifiers as their `NEString` name. -/
+def defaultResolvers : Resolvers FreeExt FreeExt where
+  resolveFree _ _ n := pure n
+  resolveFreeTarget _ _ n := pure n
 
-def parseIndexed! (input : String) : Program := (parseIndexed input).toOption.getD default
+/-- Parse a JavaScript program, keeping free names as `NEString`. -/
+def parse (input : String) : ResM (ModuleItems FreeExt FreeExt 0 0) :=
+  parseWith defaultResolvers input
 
-/-- Read a single expression in the scope `(c, m)`, computing the set of
-unknown globals it mentions. -/
-def parseExprIndexed (c m : Nat) (input : String) : ResM (ScopedExpr c m) := do
+def parseIndexedWith (resolvers : Resolvers exprExt targetExt) (input : String) :
+    ResM (ModuleItems exprExt targetExt 0 0) :=
+  parseWith resolvers (rewriteIndexRefs input)
+
+def parseExprIndexedWith (resolvers : Resolvers exprExt targetExt) (c m : Nat) (input : String) :
+    ResM (Expr exprExt targetExt c m) := do
   let e ← MiniAST.parseExpr (rewriteIndexRefs input)
-  let (_, globals) ← (ofExpr (g := (∅ : Finset NEString)) [] c m e).run ∅
-  let (expr, missing) ← (ofExpr (g := globals) [] c m e).run ∅
-  if missing = ∅ then pure ⟨globals, expr⟩
-  else .error "BrujinAST: the set of globals of the expression is not closed"
+  ofExprWith resolvers [] c m e
 
-def parseExprIndexed! (c m : Nat) (input : String) : ScopedExpr c m :=
-  (parseExprIndexed c m input).toOption.getD default
+def parseIndexed (input : String) : ResM (ModuleItems FreeExt FreeExt 0 0) :=
+  parseIndexedWith defaultResolvers input
+
+def parseIndexed! (input : String) : ModuleItems FreeExt FreeExt 0 0 :=
+  (parseIndexed input).toOption.getD .nil
+
+def parseExprIndexed (c m : Nat) (input : String) : ResM (Expr FreeExt FreeExt c m) :=
+  parseExprIndexedWith defaultResolvers c m input
+
+def parseExprIndexed! (c m : Nat) (input : String) : Expr FreeExt FreeExt c m :=
+  (parseExprIndexed c m input).toOption.getD .null
 
 end Language.JavaScript.BrujinAST

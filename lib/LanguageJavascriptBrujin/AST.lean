@@ -222,15 +222,18 @@ and `Expr.unsafeGlobal` / `Target.unsafeGlobal` build one.
 `NoExt` is the other end: a tree with no extension at all, which mentions
 nothing it does not bind. -/
 
-/-- The extension of a tree whose escape hatch is an unknown global drawn
-from `g`: a name together with the proof that it is one of `g`. -/
-abbrev GlobalExt (g : Finset NEString) : Nat → Nat → Type := fun _ _ => {n : NEString // n ∈ g}
+-- /-- The extension of a tree whose escape hatch is an unknown global drawn
+-- from `g`: a name together with the proof that it is one of `g`. -/
+-- abbrev GlobalExt (g : Finset NEString) : Nat → Nat → Type := fun _ _ => {n : NEString // n ∈ g}
 
 /-- The empty extension: a tree with no escape hatch. -/
 abbrev NoExt : Nat → Nat → Type := fun _ _ => Empty
 
+/-- The free-variable extension: an unknown identifier represented as its name. -/
+abbrev FreeExt : Nat → Nat → Type := fun _ _ => NEString
+
 /-- An extension which does not depend on the scope it lives in, and so can
-be moved to any other scope.  `GlobalExt g` is one — a global is a name, and
+be moved to any other scope.  `FreeExt` is one — a global is a name, and
 a name means the same thing in every scope — and so is `NoExt`.  It is what
 the transformations that change the scope of a tree (`Strengthen`, and
 through it the optimizer) ask of an extension; an extension which does
@@ -240,11 +243,11 @@ class ExtInvariant (ext : Nat → Nat → Type) where
   /-- Move an extension to another scope. -/
   castScope : {c m c' m' : Nat} → ext c m → ext c' m'
 
-instance globalExtInvariant {g : Finset NEString} : ExtInvariant (GlobalExt g) where
-  castScope e := e
-
 instance : ExtInvariant NoExt where
   castScope e := e.elim
+
+instance : ExtInvariant FreeExt where
+  castScope e := e
 
 /-! ## The syntax tree -/
 
@@ -619,124 +622,128 @@ The instantiation of the tree at `GlobalExt g`: a tree in the scope
 before it took its extensions as parameters.  `Program`, `OfMini` and the
 optimizer all work with these. -/
 
-namespace Global
+-- namespace Global
 
-/-- `Expr` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev Expr (c m : Nat) (g : Finset NEString) := BrujinAST.Expr (GlobalExt g) (GlobalExt g) c m
+-- /-- `Expr` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev Expr (c m : Nat) (g : Finset NEString) := BrujinAST.Expr (GlobalExt g) (GlobalExt g) c m
 
-/-- `Target` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev Target (c m : Nat) (g : Finset NEString) := BrujinAST.Target (GlobalExt g) (GlobalExt g) c m
+-- /-- `Target` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev Target (c m : Nat) (g : Finset NEString) := BrujinAST.Target (GlobalExt g) (GlobalExt g) c m
 
-/-- `ChainLink` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev ChainLink (c m : Nat) (g : Finset NEString) := BrujinAST.ChainLink (GlobalExt g) (GlobalExt g) c m
+-- /-- `ChainLink` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev ChainLink (c m : Nat) (g : Finset NEString) := BrujinAST.ChainLink (GlobalExt g) (GlobalExt g) c m
 
-/-- `ChainLinks` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev ChainLinks (c m : Nat) (g : Finset NEString) := BrujinAST.ChainLinks (GlobalExt g) (GlobalExt g) c m
+-- /-- `ChainLinks` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev ChainLinks (c m : Nat) (g : Finset NEString) := BrujinAST.ChainLinks (GlobalExt g) (GlobalExt g) c m
 
-/-- `Exprs` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev Exprs (c m : Nat) (g : Finset NEString) := BrujinAST.Exprs (GlobalExt g) (GlobalExt g) c m
+-- /-- `Exprs` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev Exprs (c m : Nat) (g : Finset NEString) := BrujinAST.Exprs (GlobalExt g) (GlobalExt g) c m
 
-/-- `OptExpr` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev OptExpr (c m : Nat) (g : Finset NEString) := BrujinAST.OptExpr (GlobalExt g) (GlobalExt g) c m
+-- /-- `OptExpr` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev OptExpr (c m : Nat) (g : Finset NEString) := BrujinAST.OptExpr (GlobalExt g) (GlobalExt g) c m
 
-/-- `ArrayElem` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev ArrayElem (c m : Nat) (g : Finset NEString) := BrujinAST.ArrayElem (GlobalExt g) (GlobalExt g) c m
+-- /-- `ArrayElem` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev ArrayElem (c m : Nat) (g : Finset NEString) := BrujinAST.ArrayElem (GlobalExt g) (GlobalExt g) c m
 
-/-- `ArrayElems` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev ArrayElems (c m : Nat) (g : Finset NEString) := BrujinAST.ArrayElems (GlobalExt g) (GlobalExt g) c m
+-- /-- `ArrayElems` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev ArrayElems (c m : Nat) (g : Finset NEString) := BrujinAST.ArrayElems (GlobalExt g) (GlobalExt g) c m
 
-/-- `TemplatePart` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev TemplatePart (c m : Nat) (g : Finset NEString) := BrujinAST.TemplatePart (GlobalExt g) (GlobalExt g) c m
+-- /-- `TemplatePart` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev TemplatePart (c m : Nat) (g : Finset NEString) := BrujinAST.TemplatePart (GlobalExt g) (GlobalExt g) c m
 
-/-- `TemplateParts` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev TemplateParts (c m : Nat) (g : Finset NEString) := BrujinAST.TemplateParts (GlobalExt g) (GlobalExt g) c m
+-- /-- `TemplateParts` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev TemplateParts (c m : Nat) (g : Finset NEString) := BrujinAST.TemplateParts (GlobalExt g) (GlobalExt g) c m
 
-/-- `PropName` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev PropName (c m : Nat) (g : Finset NEString) := BrujinAST.PropName (GlobalExt g) (GlobalExt g) c m
+-- /-- `PropName` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev PropName (c m : Nat) (g : Finset NEString) := BrujinAST.PropName (GlobalExt g) (GlobalExt g) c m
 
-/-- `Property` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev Property (c m : Nat) (g : Finset NEString) := BrujinAST.Property (GlobalExt g) (GlobalExt g) c m
+-- /-- `Property` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev Property (c m : Nat) (g : Finset NEString) := BrujinAST.Property (GlobalExt g) (GlobalExt g) c m
 
-/-- `Properties` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev Properties (c m : Nat) (g : Finset NEString) := BrujinAST.Properties (GlobalExt g) (GlobalExt g) c m
+-- /-- `Properties` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev Properties (c m : Nat) (g : Finset NEString) := BrujinAST.Properties (GlobalExt g) (GlobalExt g) c m
 
-/-- `ClassElem` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev ClassElem (c m : Nat) (g : Finset NEString) := BrujinAST.ClassElem (GlobalExt g) (GlobalExt g) c m
+-- /-- `ClassElem` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev ClassElem (c m : Nat) (g : Finset NEString) := BrujinAST.ClassElem (GlobalExt g) (GlobalExt g) c m
 
-/-- `ClassElems` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev ClassElems (c m : Nat) (g : Finset NEString) := BrujinAST.ClassElems (GlobalExt g) (GlobalExt g) c m
+-- /-- `ClassElems` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev ClassElems (c m : Nat) (g : Finset NEString) := BrujinAST.ClassElems (GlobalExt g) (GlobalExt g) c m
 
-/-- `ArrowBody` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev ArrowBody (c m : Nat) (g : Finset NEString) := BrujinAST.ArrowBody (GlobalExt g) (GlobalExt g) c m
+-- /-- `ArrowBody` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev ArrowBody (c m : Nat) (g : Finset NEString) := BrujinAST.ArrowBody (GlobalExt g) (GlobalExt g) c m
 
-/-- `SwitchCase` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev SwitchCase (c m : Nat) (g : Finset NEString) := BrujinAST.SwitchCase (GlobalExt g) (GlobalExt g) c m
+-- /-- `SwitchCase` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev SwitchCase (c m : Nat) (g : Finset NEString) := BrujinAST.SwitchCase (GlobalExt g) (GlobalExt g) c m
 
-/-- `SwitchCases` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev SwitchCases (c m : Nat) (g : Finset NEString) := BrujinAST.SwitchCases (GlobalExt g) (GlobalExt g) c m
+-- /-- `SwitchCases` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev SwitchCases (c m : Nat) (g : Finset NEString) := BrujinAST.SwitchCases (GlobalExt g) (GlobalExt g) c m
 
-/-- `OptBlock` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev OptBlock (c m : Nat) (g : Finset NEString) := BrujinAST.OptBlock (GlobalExt g) (GlobalExt g) c m
+-- /-- `OptBlock` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev OptBlock (c m : Nat) (g : Finset NEString) := BrujinAST.OptBlock (GlobalExt g) (GlobalExt g) c m
 
-/-- `TryTail` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev TryTail (c m : Nat) (g : Finset NEString) := BrujinAST.TryTail (GlobalExt g) (GlobalExt g) c m
+-- /-- `TryTail` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev TryTail (c m : Nat) (g : Finset NEString) := BrujinAST.TryTail (GlobalExt g) (GlobalExt g) c m
 
-/-- `Block` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev Block (c m : Nat) (g : Finset NEString) := BrujinAST.Block (GlobalExt g) (GlobalExt g) c m
+-- /-- `Block` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev Block (c m : Nat) (g : Finset NEString) := BrujinAST.Block (GlobalExt g) (GlobalExt g) c m
 
-/-- `ExportLocal` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev ExportLocal (c m : Nat) (g : Finset NEString) := BrujinAST.ExportLocal (GlobalExt g) (GlobalExt g) c m
+-- /-- `ExportLocal` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev ExportLocal (c m : Nat) (g : Finset NEString) := BrujinAST.ExportLocal (GlobalExt g) (GlobalExt g) c m
 
-/-- `ExportLocals` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev ExportLocals (c m : Nat) (g : Finset NEString) := BrujinAST.ExportLocals (GlobalExt g) (GlobalExt g) c m
+-- /-- `ExportLocals` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev ExportLocals (c m : Nat) (g : Finset NEString) := BrujinAST.ExportLocals (GlobalExt g) (GlobalExt g) c m
 
-/-- `ModuleItems` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev ModuleItems (c m : Nat) (g : Finset NEString) := BrujinAST.ModuleItems (GlobalExt g) (GlobalExt g) c m
+-- /-- `ModuleItems` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev ModuleItems (c m : Nat) (g : Finset NEString) := BrujinAST.ModuleItems (GlobalExt g) (GlobalExt g) c m
 
-/-- `ForInit` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev ForInit (c m : Nat) (g : Finset NEString) (dc dm : Nat) :=
-  BrujinAST.ForInit (GlobalExt g) (GlobalExt g) c m dc dm
+-- /-- `ForInit` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev ForInit (c m : Nat) (g : Finset NEString) (dc dm : Nat) :=
+--   BrujinAST.ForInit (GlobalExt g) (GlobalExt g) c m dc dm
 
-/-- `ForHead` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev ForHead (c m : Nat) (g : Finset NEString) (dc dm : Nat) :=
-  BrujinAST.ForHead (GlobalExt g) (GlobalExt g) c m dc dm
+-- /-- `ForHead` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev ForHead (c m : Nat) (g : Finset NEString) (dc dm : Nat) :=
+--   BrujinAST.ForHead (GlobalExt g) (GlobalExt g) c m dc dm
 
-/-- `Stmt` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev Stmt (c m : Nat) (g : Finset NEString) (dc dm : Nat) :=
-  BrujinAST.Stmt (GlobalExt g) (GlobalExt g) c m dc dm
+-- /-- `Stmt` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev Stmt (c m : Nat) (g : Finset NEString) (dc dm : Nat) :=
+--   BrujinAST.Stmt (GlobalExt g) (GlobalExt g) c m dc dm
 
-/-- `ModuleItem` whose escape hatch is an unknown global drawn from `g`. -/
-abbrev ModuleItem (c m : Nat) (g : Finset NEString) (dc dm : Nat) :=
-  BrujinAST.ModuleItem (GlobalExt g) (GlobalExt g) c m dc dm
+-- /-- `ModuleItem` whose escape hatch is an unknown global drawn from `g`. -/
+-- abbrev ModuleItem (c m : Nat) (g : Finset NEString) (dc dm : Nat) :=
+--   BrujinAST.ModuleItem (GlobalExt g) (GlobalExt g) c m dc dm
 
-end Global
+-- end Global
 
-/-- An unknown global, as an expression: the escape hatch of the tree
-instantiated at `GlobalExt g`. -/
-abbrev Expr.unsafeGlobal {c m : Nat} {g : Finset NEString} (name : NEString) (mem : name ∈ g) :
-    Global.Expr c m g := .unsafeExt ⟨name, mem⟩
+-- /-- An unknown global, as an expression: the escape hatch of the tree
+-- instantiated at `GlobalExt g`. -/
+-- abbrev Expr.unsafeGlobal {c m : Nat} {g : Finset NEString} (name : NEString) (mem : name ∈ g) :
+--     Global.Expr c m g := .unsafeExt ⟨name, mem⟩
 
-/-- An unknown global, as an assignment target. -/
-abbrev Target.unsafeGlobal {c m : Nat} {g : Finset NEString} (name : NEString) (mem : name ∈ g) :
-    Global.Target c m g := .unsafeExt ⟨name, mem⟩
+-- /-- An unknown global, as an assignment target. -/
+-- abbrev Target.unsafeGlobal {c m : Nat} {g : Finset NEString} (name : NEString) (mem : name ∈ g) :
+--     Global.Target c m g := .unsafeExt ⟨name, mem⟩
 
-/-- A whole program: top level items in the empty scope, together with the
-set of unknown globals they mention.  The set is a field rather than a
-parameter so that `Program` is an ordinary type: two programs which name
-different globals still have the same type. -/
-structure Program where
-  /-- The unknown globals the program mentions. -/
-  globals : Finset NEString
-  /-- The top level items. -/
-  items : Global.ModuleItems 0 0 globals
+-- /-- A whole program: top level items in the empty scope, together with the
+-- set of unknown globals they mention.  The set is a field rather than a
+-- parameter so that `Program` is an ordinary type: two programs which name
+-- different globals still have the same type. -/
+-- structure Program where
+--   /-- The unknown globals the program mentions. -/
+--   globals : Finset NEString
+--   /-- The top level items. -/
+--   items : Global.ModuleItems 0 0 globals
 
-/-- An expression in the scope `(c, m)`, together with the set of unknown
-globals it mentions. -/
-structure ScopedExpr (c m : Nat) where
-  /-- The unknown globals the expression mentions. -/
-  globals : Finset NEString
-  /-- The expression. -/
-  expr : Global.Expr c m globals
+-- /-- An expression in the scope `(c, m)`, together with the set of unknown
+-- globals it mentions. -/
+-- structure ScopedExpr (c m : Nat) where
+--   /-- The unknown globals the expression mentions. -/
+--   globals : Finset NEString
+--   /-- The expression. -/
+--   expr : Global.Expr c m globals
+
+/-- A whole program: top level items in the empty scope. -/
+abbrev Program (exprExt targetExt : Nat → Nat → Type := FreeExt) :=
+  ModuleItems exprExt targetExt 0 0
 
 /-! ## Default values -/
 
@@ -768,8 +775,8 @@ instance {c m : Nat} : Inhabited (Stmt exprExt targetExt c m 0 0) := ⟨.expr de
 instance {c m : Nat} : Inhabited (ExportLocals exprExt targetExt c m) := ⟨.nil⟩
 instance {c m : Nat} : Inhabited (ModuleItem exprExt targetExt c m 0 0) := ⟨.stmt default⟩
 instance {c m : Nat} : Inhabited (ModuleItems exprExt targetExt c m) := ⟨.nil⟩
-instance : Inhabited Program := ⟨⟨∅, .nil⟩⟩
-instance {c m : Nat} : Inhabited (ScopedExpr c m) := ⟨⟨∅, .null⟩⟩
+-- instance : Inhabited Program := ⟨⟨∅, .nil⟩⟩
+-- instance {c m : Nat} : Inhabited (ScopedExpr c m) := ⟨⟨∅, .null⟩⟩
 
 /-! ## Lists -/
 
@@ -908,16 +915,16 @@ def mutIndex? (m l : Nat) : Option (Fin m) :=
 @[simp] theorem constIndex?_constLevel {c : Nat} (i : Fin c) :
     constIndex? c (constLevel i) = some i := by
   have h := i.isLt
-  simp only [constIndex?, constLevel]
-  rw [dif_pos (by omega)]
-  exact congrArg some (Fin.ext (by simp; omega))
+  have hlt : constLevel i < c := by simp [constLevel]; omega
+  simp only [constIndex?, dite_eq_left hlt]
+  congr 1; ext; simp [constLevel]; omega
 
 @[simp] theorem mutIndex?_mutLevel {m : Nat} (i : Fin m) :
     mutIndex? m (mutLevel i) = some i := by
   have h := i.isLt
-  simp only [mutIndex?, mutLevel]
-  rw [dif_pos (by omega)]
-  exact congrArg some (Fin.ext (by simp; omega))
+  have hlt : mutLevel i < m := by simp [mutLevel]; omega
+  simp only [mutIndex?, dite_eq_left hlt]
+  congr 1; ext; simp [mutLevel]; omega
 
 def constName (l : Nat) : NEString := ⟨"_c" ++ toString l, by simp⟩
 def mutName (l : Nat) : NEString := ⟨"_m" ++ toString l, by simp⟩

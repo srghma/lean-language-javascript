@@ -130,10 +130,11 @@ theorem ofRange?_eq {s : String} {pre mid rest : List Char}
       have h2 : (String.ofList ([] ++ [d])).toList = [] ++ d :: [] := by simp
       have hprevR : String.Pos.Raw.prev (String.ofList ([] ++ [d])) ⟨blen ([] ++ [d])⟩ = ⟨0⟩ := by
         simpa using prev_eq h2
+      have hle : ¬ (blen pre + d.utf8Size ≤ blen pre) := by omega
       rw [hprevL, hprevR]
       rcases hq : QuoteKind.ofChar? (String.Pos.Raw.get s ⟨blen pre⟩) with _ | q <;>
         rcases hq' : QuoteKind.ofChar? (String.Pos.Raw.get (String.ofList ([] ++ [d])) ⟨0⟩) with
-          _ | q' <;> simp
+          _ | q' <;> simp [ite_self, hle]
     | cons c cs =>
       have hc := c.utf8Size_pos
       -- the first character

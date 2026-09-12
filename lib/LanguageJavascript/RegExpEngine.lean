@@ -16,10 +16,10 @@ This module is the bridge between the two:
 * `RegExpLit.librarySource` is the pattern in the syntax the library reads
   (JavaScript writes the delimiter escaped, `\/`, which the library does not
   accept as an escape);
-* `RegExpLit.ast?`, `RegExpLit.expr?` and `RegExpLit.compile?` parse and
+* `RegExpLit.expr?` and `RegExpLit.compile?` parse and
   compile the pattern with the library, honouring the `i` and `s` flags;
-* `RegExpCompiled` is a literal *together with* the library's parse tree of
-  its pattern and a proof that it really is the parse tree of that pattern,
+* `RegExpCompiled` is a literal *together with* the library's compiled
+  `Expr` of its pattern and a proof that it really is the parse tree of that pattern,
   so that the compiled `Regex`, and hence `test`, `find`, `replace`, … are
   total on it;
 * `RegExpLit.compiled?` is the smart constructor.
@@ -55,7 +55,7 @@ import LanguageJavascript.Types
 
 namespace Language.JavaScript
 
-open Regex.Syntax.Parser (Ast ParseOption ToRegexState parseAst)
+open Regex.Syntax.Parser (ParseOption)
 open Regex.Data (Class Classes Expr)
 
 namespace RegExpFlags
@@ -107,37 +107,39 @@ def unescapeDelimiter (pat : String) : Nat → String.Pos.Raw → String → Str
 def librarySource (r : RegExpLit) : String :=
   unescapeDelimiter r.source.val r.source.val.utf8ByteSize ⟨0⟩ ""
 
-/-- The parse tree of `.`, once the `s` flag is taken into account: the
-class of every character. -/
-def anyCharAst : Ast :=
-  .classes (Classes.atom (Class.range (Char.ofNat 0) (Char.ofNat Char.MAX_UNICODE)))
+/-- The characters `.` matches by default: all characters except line breaks. -/
+def dotClasses : Classes := .union (.atom .beforeLineBreak) (.atom .afterLineBreak)
 
-/-- Apply the `s` flag to a parse tree: with `dotAll`, a `.` matches a line
-break too, which the library's `.` does not. -/
-def applyDotAll : Ast → Ast
-  | .dot => anyCharAst
-  | .group a => .group (applyDotAll a)
+/-- The class of every character, for the `s` flag (`dotAll`). -/
+def anyCharExpr : Expr :=
+  .classes (Classes.atom (Class.range (Char.ofNat 0) (Char.ofNat 0x10FFFF)))
+
+/-- Apply the `s` flag to an `Expr`: with `dotAll`, a `.` matches a line
+break too. -/
+def applyDotAll : Expr → Expr
+  | .classes cs => if cs == dotClasses then anyCharExpr else .classes cs
+  | .group i e => .group i (applyDotAll e)
   | .alternate a b => .alternate (applyDotAll a) (applyDotAll b)
   | .concat a b => .concat (applyDotAll a) (applyDotAll b)
-  | .repeat min max greedy a => .repeat min max greedy (applyDotAll a)
-  | a => a
+  | .star g e => .star g (applyDotAll e)
+  | e => e
 
-/-- The parse tree the library gives the pattern, with the `s` flag applied;
+/-- The compiled `Expr` the library gives the pattern, with `i` and `s` applied;
 `none` when the pattern uses syntax the library does not read. -/
-def ast? (r : RegExpLit) : Option Ast :=
-  match parseAst r.librarySource with
-  | .ok a => some (if r.flags.dotAll then applyDotAll a else a)
+def expr? (r : RegExpLit) : Option Expr :=
+  match Regex.Syntax.Parser.parseAux r.librarySource r.flags.toParseOption with
+  | .ok e => some (if r.flags.dotAll then applyDotAll e else e)
   | .error _ => none
 
 /-- Whether the library reads the pattern of the literal. -/
-def patternSupported (r : RegExpLit) : Bool := r.ast?.isSome
+def patternSupported (r : RegExpLit) : Bool := r.expr?.isSome
 
 end RegExpLit
 
 /-! ## A literal the library understands -/
 
 /-- A regular expression literal whose pattern the library reads, together
-with that parse tree and the proof that it is the one the library's parser
+with that compiled expression and the proof that it is the one the library's parser
 returns.  Compiling and matching are therefore *total* on this type: no
 `Option`, no `panic!`, no default pattern silently standing in for one that
 could not be read.
@@ -147,10 +149,10 @@ library's search means; see the header of this module. -/
 structure RegExpCompiled where
   /-- The literal. -/
   lit : RegExpLit
-  /-- Its pattern, as the library parses it, with the `s` flag applied. -/
-  ast : Ast
-  /-- `ast` is what the library's parser answers on the pattern. -/
-  parses : lit.ast? = some ast
+  /-- Its pattern, as compiled by the library into an `Expr`, with the `s` flag applied. -/
+  expr : Expr
+  /-- `expr` is what the library's parser answers on the pattern. -/
+  parses : lit.expr? = some expr
   /-- The flags are ones a search can honour. -/
   searchable : lit.flags.searchSupported = true
 
@@ -160,16 +162,10 @@ namespace RegExpCompiled
 meaning of a search unchanged. -/
 def of? (lit : RegExpLit) : Option RegExpCompiled :=
   if hf : lit.flags.searchSupported = true then
-    match h : lit.ast? with
+    match h : lit.expr? with
     | some a => some ⟨lit, a, h, hf⟩
     | none => none
   else none
-
-/-- The regular expression of the library, as an `Expr`.  The pattern is
-wrapped in a group, as the library's own `parse` does, so that group 0 is
-the whole match. -/
-def expr (c : RegExpCompiled) : Expr :=
-  (Ast.toRegexAux (ToRegexState.mk 0 c.lit.flags.ignoreCase) (.group c.ast)).2
 
 /-- The compiled regular expression: an NFA, and the proof that it is well
 formed, built by the library. -/
@@ -234,12 +230,6 @@ namespace RegExpLit
 syntax the library does not read, or its flags change what a search means
 (`m`, `y`). -/
 def compiled? (r : RegExpLit) : Option RegExpCompiled := RegExpCompiled.of? r
-
-/-- The regular expression of the library the pattern denotes, ignoring the
-flags which only matter to a search. -/
-def expr? (r : RegExpLit) : Option Expr :=
-  r.ast?.map fun a =>
-    (Ast.toRegexAux (ToRegexState.mk 0 r.flags.ignoreCase) (.group a)).2
 
 /-- The pattern, compiled to an NFA by the library. -/
 def compile? (r : RegExpLit) : Option Regex := r.expr?.map Regex.fromExpr

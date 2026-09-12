@@ -13,11 +13,9 @@ level `N`, `_mN` the mutable one, and a name that stayed a name is one that
 was not bound anywhere (the `unsafeGlobal` escape hatch).
 -/
 import Spec
-import Mathlib.Data.Finset.Card
 import LanguageJavascriptBrujin.AST
 import LanguageJavascriptBrujin.OfMini
 import LanguageJavascriptBrujin.ToMini
-import LanguageJavascriptBrujin.Weaken
 
 namespace LanguageJavascriptTests.Brujin.AST
 
@@ -200,94 +198,37 @@ type of a variable is what keeps it in scope. -/
 /-- The one unknown global the trees below mention. -/
 def printName : Language.JavaScript.NEString := ⟨"print", by decide⟩
 
-/-- The set of unknown globals of the trees below: the type of a tree lists
-every name it mentions and does not bind. -/
-def printGlobals : Finset Language.JavaScript.NEString := {printName}
-
 /-- `(x) => x`, in the empty scope, mentioning no global at all. -/
-def identityFn : Global.Expr 0 0 ∅ := .arrow 1 false (.expr (.mutVar 0))
+def identityFn : Expr NoExt NoExt 0 0 := .arrow 1 false (.expr (.mutVar 0))
 
 /-- `(x, y) => x + y`: the *first* parameter is the *last* index. -/
-def plusFn : Global.Expr 0 0 ∅ :=
+def plusFn : Expr NoExt NoExt 0 0 :=
   .arrow 2 false (.expr (.binary (.mutVar 1) .plus (.mutVar 0)))
 
 /-- `(x, ...xs) => xs`: the tree records that there is a rest parameter,
 which is the last binder and so `mutVar 0`. -/
-def restFn : Global.Expr 0 0 ∅ := .arrow 1 true (.expr (.mutVar 0))
+def restFn : Expr NoExt NoExt 0 0 := .arrow 1 true (.expr (.mutVar 0))
 
 /-- An expression that mentions the two variables of its scope and one
-global; it only typechecks in a scope with a const and a mutable variable,
-and only against a set of globals that has `print` in it. -/
-def usesBoth : Global.Expr 1 1 printGlobals :=
-  .call (.unsafeGlobal printName (Finset.mem_singleton_self _))
+global; it only typechecks in a scope with a const and a mutable variable. -/
+def usesBoth : Expr FreeExt FreeExt 1 1 :=
+  .call (.unsafeExt printName)
     (.cons (.binary (.constVar 0) .plus (.mutVar 0)) .nil)
 
 /-- `const x = 1; print(x);` -/
 def tinyProgram : Program :=
-  ⟨printGlobals,
-    .cons (.stmt (.constDecl (.number (Language.JavaScript.JSNumber.ofNat 1))))
-      (.cons (.stmt (.expr (.call (.unsafeGlobal printName (Finset.mem_singleton_self _))
-        (.cons (.constVar 0) .nil)))) .nil)⟩
+  .cons (.stmt (.constDecl (.number (Language.JavaScript.JSNumber.ofNat 1))))
+    (.cons (.stmt (.expr (.call (.unsafeExt printName)
+      (.cons (.constVar 0) .nil)))) .nil)
 
 /-- The name `Math`, which is a free name like any other. -/
 def mathName : Language.JavaScript.NEString := ⟨"Math", by decide⟩
 
-/-- The set of unknown globals of `usesMath`. -/
-def mathGlobals : Finset Language.JavaScript.NEString := {mathName}
-
-/-- `Math.max(1, 2)`: `Math` is a name the tree does not bind, so it is one
-of the globals its type lists. -/
-def usesMath : Global.Expr 0 0 mathGlobals :=
-  .call (.dot (.unsafeGlobal mathName (Finset.mem_singleton_self _)) ⟨"max", by decide⟩)
+/-- `Math.max(1, 2)`: `Math` is a name the tree does not bind. -/
+def usesMath : Expr FreeExt FreeExt 0 0 :=
+  .call (.dot (.unsafeExt mathName) ⟨"max", by decide⟩)
     (.cons (.number (Language.JavaScript.JSNumber.ofNat 1))
       (.cons (.number (Language.JavaScript.JSNumber.ofNat 2)) .nil))
-
-/-! ## The set of globals
-
-A `Global.*` tree is instantiated at the set of names it mentions but
-does not bind.  Every free name goes in it, the standard ECMAScript globals
-included.  These cases read source and look at the set the conversion
-computed. -/
-
-/-- How many unknown globals does the program mention? -/
-def globalCount (src : String) : String :=
-  match parse src with
-  | .ok p => toString p.globals.card
-  | .error e => "ERROR: " ++ e
-
-/-- Is `name` one of the unknown globals of the program? -/
-def mentionsGlobal (src name : String) : String :=
-  match parse src with
-  | .ok p => toString (decide (Language.JavaScript.NEString.ofString! name ∈ p.globals))
-  | .error e => "ERROR: " ++ e
-
-def globalsCases : List (String × String × String) :=
-  [ ("a standard global is an unknown global too", globalCount "Math.max(1, 2);", "1")
-  , ("and so is JSON, counted once", globalCount "JSON.stringify(JSON.parse(\"1\"));", "1")
-  , ("the collections and the parsers each count",
-      globalCount "new Map([[1, new Set()]]); parseInt(\"3\", 10); isNaN(0);", "4")
-  , ("and so do the text and URL transformers",
-      globalCount "new TextDecoder().decode(new TextEncoder().encode(atob(s0)));", "4")
-  , ("an error type counts", globalCount "throw new TypeError(\"x\");", "1")
-  , ("two unrelated names count twice", globalCount "console.log(fetch(1));", "2")
-  , ("and it is the name itself", mentionsGlobal "console.log(fetch(1));" "console", "true")
-  , ("a standard name turns up there as well",
-      mentionsGlobal "console.log(Math.PI);" "Math", "true")
-  , ("a bound name is not a global", globalCount "const x = 1; x + x;", "0")
-  , ("the same unknown name twice counts once", globalCount "foo(foo(foo));", "1")
-  , ("a global is printed as itself", brujinRender "Math.max(x, 1);", "Math.max(x, 1);\n")
-  , ("a global can be assigned to", brujinRender "Math = 1;", "Math = 1;\n")
-  , ("and it can be incremented", brujinRender "JSON++;", "JSON++;\n")
-  , ("a member of one can be assigned to", brujinRender "Math.x = 1;", "Math.x = 1;\n")
-  ]
-
-/-! ## Weakening
-
-A tree built against `g` is a legal tree against any larger set. -/
-
-/-- The same expression as `usesBoth`, moved into a bigger set of globals. -/
-def usesBothWeakened : Global.Expr 1 1 (insert (Language.JavaScript.NEString.ofString! "other") printGlobals) :=
-  Expr.weaken (Finset.subset_insert _ _) usesBoth
 
 def spec : Spec := do
   describe "BrujinAST Scope Resolution" do
@@ -322,19 +263,5 @@ def spec : Spec := do
       shouldEqual (toString (match parse (printProgram tinyProgram) with
         | .ok q => q == tinyProgram
         | .error _ => false)) "true"
-
-  describe "BrujinAST Globals" do
-    for (label, actual, expected) in globalsCases do
-      it label do
-        shouldEqual actual expected
-
-  describe "BrujinAST Weakening" do
-    it "weakening does not change the tree" do
-      shouldEqual (printExpr usesBothWeakened) (printExpr usesBoth)
-    it "a program can be moved into a bigger set of globals" do
-      shouldEqual
-        (printProgram (tinyProgram.weakenTo
-          (Finset.subset_insert (Language.JavaScript.NEString.ofString! "other") _)))
-        (printProgram tinyProgram)
 
 end LanguageJavascriptTests.Brujin.AST

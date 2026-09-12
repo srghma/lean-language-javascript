@@ -19,7 +19,7 @@ as `parse?`, written on a `List Char`:
 * `parseList?_eq_parseCharsList?` says that the one pass reader computes
   what the `filter`/`span` based one computed.
 -/
-import Mathlib.Data.List.TakeDrop
+-- import Mathlib.Data.List.TakeDrop
 import LanguageJavascript.RegExpLitSpec
 
 set_option autoImplicit false
@@ -943,6 +943,21 @@ def parseCharsAlt? (l : List Char) : Option JSNumber :=
     | none => (cs0, false)
   if cs.isEmpty then none else oldCore cs isBig
 
+theorem List.span_loop_eq {α : Type} (p : α → Bool) (as : List α) (acc : List α) :
+    List.span.loop p as acc = (acc.reverse ++ as.takeWhile p, as.dropWhile p) := by
+  induction as generalizing acc with
+  | nil => simp [List.span.loop]
+  | cons a as ih =>
+    simp [List.span.loop]
+    split <;> rename_i h
+    · rw [ih (a :: acc)]
+      simp [List.takeWhile, List.dropWhile, h]
+    · simp [List.takeWhile, List.dropWhile, h]
+
+theorem List.span_eq_takeWhile_dropWhile {α : Type} (p : α → Bool) (l : List α) :
+    l.span p = (l.takeWhile p, l.dropWhile p) := by
+  simp [List.span, span_loop_eq]
+
 theorem splitE_eq (cs : List Char) :
     (match cs.span (fun c => c ≠ 'e' && c ≠ 'E') with
      | (m, []) => (m, ([] : List Char))
@@ -1121,9 +1136,12 @@ theorem foldStep8_isSome : ∀ (cs : List Char) (a : Nat),
     cases hdv : digitVal? c with
     | none =>
       have hc : ('0' ≤ c && c ≤ '7') = false := by
-        by_contra hcon
-        obtain ⟨d, hd, _⟩ := digit_of_octal (by simpa using hcon)
-        rw [hdv] at hd; simp at hd
+        by_cases hcon : ('0' ≤ c && c ≤ '7') = true
+        · have ⟨d, hd, _⟩ := digit_of_octal hcon
+          rw [hdv] at hd; cases hd
+        · cases h : ('0' ≤ c && c ≤ '7')
+          · rfl
+          · contradiction
       simp [hc]
     | some d =>
       by_cases hlt : d < 8
@@ -1131,10 +1149,13 @@ theorem foldStep8_isSome : ∀ (cs : List Char) (a : Nat),
         simp only [ite_eq_left hlt, hc, Bool.true_and]
         exact ih _
       · have hc : ('0' ≤ c && c ≤ '7') = false := by
-          by_contra hcon
-          obtain ⟨d', hd', hlt'⟩ := digit_of_octal (by simpa using hcon)
-          rw [hdv, Option.some.injEq] at hd'
-          omega
+          by_cases hcon : ('0' ≤ c && c ≤ '7') = true
+          · have ⟨d', hd', hlt'⟩ := digit_of_octal hcon
+            rw [hdv, Option.some.injEq] at hd'
+            omega
+          · cases h : ('0' ≤ c && c ≤ '7')
+            · rfl
+            · contradiction
         simp [hlt, hc]
 
 theorem digitsVal?_octal_guard (c : Char) (rest : List Char) :

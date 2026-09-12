@@ -48,13 +48,12 @@ class ExtPrinter (exprExt targetExt : Nat → Nat → Type) where
   targetExtToMini : {c m : Nat} → targetExt c m → MiniExpr :=
     fun e => rawToken (printUnsafeTargetExt e)
 
-/-- A tree whose unknown names are globals drawn from `g` is written by
-writing the name. -/
-instance globalExtPrinter {g : Finset NEString} : ExtPrinter (GlobalExt g) (GlobalExt g) where
-  printUnsafeExprExt n := .text n.val.val
-  printUnsafeTargetExt n := .text n.val.val
-  exprExtToMini n := .ident n.val
-  targetExtToMini n := .ident n.val
+/-- A tree whose unknown names are free variables is written by writing the name. -/
+instance : ExtPrinter FreeExt FreeExt where
+  printUnsafeExprExt n := .text n.val
+  printUnsafeTargetExt n := .text n.val
+  exprExtToMini n := .ident n
+  targetExtToMini n := .ident n
 
 /-- A tree with no extension has nothing to print. -/
 instance : ExtPrinter NoExt NoExt where
@@ -65,11 +64,11 @@ class NamingScheme where
   constNameOf : (level : Nat) → (index : Nat) → NEString
   mutNameOf : (level : Nat) → (index : Nat) → NEString
 
-def levelNaming : NamingScheme where
+@[instance_reducible] def levelNaming : NamingScheme where
   constNameOf l _ := constName l
   mutNameOf l _ := mutName l
 
-def indexNaming : NamingScheme where
+@[instance_reducible] def indexNaming : NamingScheme where
   constNameOf _ i := idxConstName i
   mutNameOf _ i := idxMutName i
 
@@ -348,7 +347,7 @@ def toMiniModuleItems {c m : Nat} : ModuleItems exprExt targetExt c m → List M
   | .nil => []
   | .cons it r => toMiniModuleItem it :: toMiniModuleItems r
 
-def toMiniProgram (p : Program) : MiniProgram := ⟨toMiniModuleItems p.items⟩
+def toMiniProgram (p : ModuleItems exprExt targetExt 0 0) : MiniProgram := ⟨toMiniModuleItems p⟩
 
 end Naming
 
@@ -358,12 +357,13 @@ section Printing
 -- The extensions of the tree being printed, and how they are written.
 variable {exprExt targetExt : Nat → Nat → Type} [extPrinter : ExtPrinter exprExt targetExt]
 
-def printProgram (p : Program) : String :=
+def printProgram (p : ModuleItems exprExt targetExt 0 0) : String :=
   MiniAST.printProgram (toMiniProgram p)
 
-def toMiniProgramIndexed (p : Program) : MiniProgram := toMiniProgram (naming := indexNaming) p
+def toMiniProgramIndexed (p : ModuleItems exprExt targetExt 0 0) : MiniProgram :=
+  ⟨toMiniModuleItems (naming := indexNaming) p⟩
 
-def printProgramIndexed (p : Program) : String :=
+def printProgramIndexed (p : ModuleItems exprExt targetExt 0 0) : String :=
   MiniAST.printProgram (toMiniProgramIndexed p)
 
 def printExprIndexed {c m : Nat} (e : Expr exprExt targetExt c m) : String :=
@@ -375,23 +375,22 @@ def printBlock {c m : Nat} (b : Block exprExt targetExt c m) : String :=
 def printExpr {c m : Nat} (e : Expr exprExt targetExt c m) : String :=
   MiniAST.printExpr (toMiniExpr e)
 
-/-- Print an expression which carries its own set of globals, with the
-level based names. -/
-def printScopedExpr {c m : Nat} (e : ScopedExpr c m) : String := printExpr e.expr
+/-- Print an expression with level-based names. -/
+def printScopedExpr {c m : Nat} (e : Expr exprExt targetExt c m) : String := printExpr e
 
-/-- Print an expression which carries its own set of globals, naming the
-variables by their de Bruijn index. -/
-def printScopedExprIndexed {c m : Nat} (e : ScopedExpr c m) : String :=
-  printExprIndexed e.expr
+/-- Print an expression, naming variables by their de Bruijn index. -/
+def printScopedExprIndexed {c m : Nat} (e : Expr exprExt targetExt c m) : String :=
+  printExprIndexed e
 
 instance {c m : Nat} : BEq (Expr exprExt targetExt c m) := ⟨fun a b => toMiniExpr a == toMiniExpr b⟩
 instance {c m : Nat} : BEq (Block exprExt targetExt c m) := ⟨fun a b => toMiniBlock a == toMiniBlock b⟩
 instance {c m dc dm : Nat} : BEq (Stmt exprExt targetExt c m dc dm) :=
   ⟨fun a b => toMiniStmt a == toMiniStmt b⟩
-instance : BEq Program := ⟨fun a b => toMiniProgram a == toMiniProgram b⟩
+instance {c m : Nat} : BEq (ModuleItems exprExt targetExt c m) :=
+  ⟨fun a b => toMiniModuleItems a == toMiniModuleItems b⟩
 
 instance {c m : Nat} : ToString (Expr exprExt targetExt c m) := ⟨printExpr⟩
-instance : ToString Program := ⟨printProgram⟩
+instance : ToString (ModuleItems exprExt targetExt 0 0) := ⟨printProgram⟩
 
 end Printing
 
@@ -408,7 +407,7 @@ variable {exprExt targetExt : Nat → Nat → Type}
 
 /-- The printer built from the two documents, each extension being written
 verbatim where it stands. -/
-def extPrinterOf : ExtPrinter exprExt targetExt where
+@[instance_reducible] def extPrinterOf : ExtPrinter exprExt targetExt where
   printUnsafeExprExt := printUnsafeExprExt
   printUnsafeTargetExt := printUnsafeTargetExt
 
