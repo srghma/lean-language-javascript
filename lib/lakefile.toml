@@ -1,5 +1,9 @@
 name = "LanguageJavascript"
-defaultTargets = ["LanguageJavascript", "LanguageJavascriptMini", "LanguageJavascriptBrujin"]
+defaultTargets = [
+  "LanguageJavascript",
+  "LanguageJavascriptMini",
+  "LanguageJavascriptBrujin",
+]
 
 [[lean_lib]]
 name = "LanguageJavascript"
@@ -20,3 +24,9 @@ root = "LanguageJavascriptTests.Main"
 [[lean_exe]]
 name = "bench"
 root = "LanguageJavascriptBench.Main"
+
+[[require]]
+name = "Regex"
+git = "https://github.com/pandaman64/lean-regex"
+rev = "main"
+subDir = "regex"

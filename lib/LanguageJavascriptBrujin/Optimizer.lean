@@ -43,12 +43,19 @@ count as having one.
 
 Every rewrite is a rewrite of the *program*, not of a value: the optimizer
 does not assume anything about a variable it cannot see the binding of, and
-an `unsafeGlobal` is never touched.
+an `unsafeExt` is never touched.
 -/
 import LanguageJavascriptBrujin.ToMini
 import LanguageJavascriptBrujin.Strengthen
+import LanguageJavascript.RegExpEngine
 
 namespace Language.JavaScript.BrujinAST
+
+-- The extensions a tree may mention.  Every function here is generic in
+-- them: the optimizer never looks inside an extension, and only has to be
+-- able to move one to a smaller scope when it deletes a binding.
+variable {exprExt targetExt : Nat → Nat → Type}
+  [ExtInvariant exprExt] [ExtInvariant targetExt]
 
 open Language.JavaScript.MiniAST
 
@@ -73,54 +80,33 @@ deriving Repr, DecidableEq, Inhabited
 /-- The largest integer JavaScript represents exactly. -/
 def maxSafeInteger : Int := 9007199254740991
 
-/-- The value of a digit in base 16, if it is one. -/
-private def digitValue? (ch : Char) : Option Nat :=
-  if ch.isDigit then some (ch.toNat - '0'.toNat)
-  else if 'a' ≤ ch && ch ≤ 'f' then some (ch.toNat - 'a'.toNat + 10)
-  else none
-
-/-- Read a natural number in the given base; `none` if a character is not a
-digit of that base, or if there is no digit at all. -/
-private def natOfDigits? (base : Nat) (cs : List Char) : Option Nat :=
-  if cs.isEmpty then none
-  else cs.foldl (init := some 0) fun acc ch => do
-    let d ← digitValue? ch
-    if d < base then pure ((← acc) * base + d) else none
-
 /-- The value of a numeric literal, when it is an integer JavaScript
-represents exactly; a literal with a fraction or an exponent has none. -/
-def intOfNumeral? (raw : String) : Option Int :=
-  let cs := raw.toLower.toList
-  let n? :=
-    match cs with
-    | '0' :: 'x' :: rest => natOfDigits? 16 rest
-    | '0' :: 'b' :: rest => natOfDigits? 2 rest
-    | '0' :: 'o' :: rest => natOfDigits? 8 rest
-    | _ => natOfDigits? 10 cs
-  match n? with
-  | some n => if (n : Int) ≤ maxSafeInteger then some (n : Int) else none
+represents exactly; a literal with a fraction or one too large has none. -/
+def intOfNumeral? (n : JSNumber) : Option Int :=
+  match n.toNat? with
+  | some v => if (v : Int) ≤ maxSafeInteger then some (v : Int) else none
   | none => none
 
 /-- The literal an expression is, if it is one the optimizer computes
 with. -/
-def litOf? {c m : Nat} : Expr c m → Option Lit
-  | .number raw => (intOfNumeral? raw.val).map .num
+def litOf? {c m : Nat} : Expr exprExt targetExt c m → Option Lit
+  | .number n => (intOfNumeral? n).map .num
   | .string v => some (.str v)
   | .true_ => some (.bool true)
   | .false_ => some (.bool false)
   | .null => some .null
   | .unary .minus e =>
       match e with
-      | .number raw => (intOfNumeral? raw.val).map fun v => .num (-v)
+      | .number n => (intOfNumeral? n).map fun v => .num (-v)
       | _ => none
   | _ => none
 
 /-- The expression a literal value is written as; a negative number is a
 literal with a unary minus, as JavaScript has no negative literal. -/
-def exprOfLit {c m : Nat} : Lit → Expr c m
+def exprOfLit {c m : Nat} : Lit → Expr exprExt targetExt c m
   | .num v =>
-      if v < 0 then .unary .minus (.number (NEString.ofString! (toString (-v))))
-      else .number (NEString.ofString! (toString v))
+      if v < 0 then .unary .minus (.number (JSNumber.ofNat (-v).toNat))
+      else .number (JSNumber.ofNat v.toNat)
   | .str s => .string s
   | .bool true => .true_
   | .bool false => .false_
@@ -143,7 +129,7 @@ def Lit.toJSString : Lit → String
 
 /-- Whether every character is ASCII, so that Lean's ordering of the string
 is JavaScript's. -/
-private def isAscii (s : String) : Bool := s.toList.all fun ch => ch.toNat < 128
+private def isAscii (s : String) : Bool := s.all fun ch : Char => ch.toNat < 128
 
 /-! ## Purity
 
@@ -156,23 +142,34 @@ mutual
 
 /-- Whether an expression can be evaluated without an observable effect,
 conservatively. -/
-partial def Expr.isPure {c m : Nat} : Expr c m → Bool
-  | .mutVar _ | .constVar _ | .unsafeGlobal _ => true
+def Expr.isPure {c m : Nat} : Expr exprExt targetExt c m → Bool
+  | .mutVar _ | .constVar _ | .unsafeExt _ => true
   | .number _ | .string _ | .regex _ | .null | .true_ | .false_ | .this => true
+  -- `new.target` is a read of the current invocation, with no effect
+  | .newTarget => true
+  -- `super.x` reads a member of the home object, which may be a getter,
+  -- and `super(...)` runs the constructor of the parent class
+  | .superDot _ | .superIndex _ | .superCall _ => false
   | .array els => ArrayElems.isPure els
   | .object ps => Properties.isPure ps
   | .assign _ _ _ | .update _ _ _ => false
   | .await _ | .yield _ | .yieldFrom _ => false
   | .call _ _ | .new _ _ => false
-  | .dot _ _ | .index _ _ => false
-  | .classAnon _ _ | .classSelf _ _ => false
+  | .dot _ _ | .index _ _ | .privateDot _ _ => false
+  | .privateName _ => true
+  -- a chain reads a member or calls, exactly like what it is written for
+  | .chain _ _ _ => false
+  | .importMeta => true
+  -- a dynamic import loads a module
+  | .importCall _ _ => false
+  | .classAnon _ _ _ | .classSelf _ _ _ => false
   | .seq a b => a.isPure && b.isPure
   | .binary a op b =>
       match op with
       | .inOp | .instanceOf => false
       | _ => a.isPure && b.isPure
   | .ternary a b d => a.isPure && b.isPure && d.isPure
-  | .arrow _ _ | .func _ _ _ _ | .funcSelf _ _ _ _ => true
+  | .arrow _ _ _ | .func _ _ _ _ _ | .funcSelf _ _ _ _ _ => true
   | .spread _ => false
   | .template _ _ _ => false
   | .unary op e =>
@@ -181,34 +178,51 @@ partial def Expr.isPure {c m : Nat} : Expr c m → Bool
       | _ => e.isPure
 
 /-- Whether every element of an array literal is pure. -/
-partial def ArrayElems.isPure {c m : Nat} : ArrayElems c m → Bool
+def ArrayElems.isPure {c m : Nat} : ArrayElems exprExt targetExt c m → Bool
   | .nil => true
   | .cons .hole r => ArrayElems.isPure r
   | .cons (.elem e) r => e.isPure && ArrayElems.isPure r
 
 /-- Whether every member of an object literal is pure. -/
-partial def Properties.isPure {c m : Nat} : Properties c m → Bool
+def Properties.isPure {c m : Nat} : Properties exprExt targetExt c m → Bool
   | .nil => true
   | .cons (.keyValue k v) r => PropName.isPure k && v.isPure && Properties.isPure r
-  | .cons (.method _ k _ _) r => PropName.isPure k && Properties.isPure r
+  -- a spread reads every property of what it copies, so it can run a getter
+  | .cons (.spread _) _ => false
+  | .cons (.method _ k _ _ _) r => PropName.isPure k && Properties.isPure r
 
 /-- Whether the name of a property is pure. -/
-partial def PropName.isPure {c m : Nat} : PropName c m → Bool
-  | .ident _ | .string _ | .number _ => true
+def PropName.isPure {c m : Nat} : PropName exprExt targetExt c m → Bool
+  | .ident _ | .private_ _ | .string _ | .number _ => true
   | .computed e => e.isPure
 
 end
 
+/-- Whether a list of expressions is empty; a decorator is run when the
+class is defined, so a decorated member is not effect free. -/
+def Exprs.isNil {c m : Nat} : Exprs exprExt targetExt c m → Bool
+  | .nil => true
+  | .cons _ _ => false
+
 /-- Whether an optional expression is pure. -/
-def OptExpr.isPure {c m : Nat} : OptExpr c m → Bool
+def OptExpr.isPure {c m : Nat} : OptExpr exprExt targetExt c m → Bool
   | .none => true
   | .some e => e.isPure
 
-/-- Whether the keys of a class body are pure, which is what decides
-whether declaring the class has an effect (its methods are not run). -/
-def ClassElems.keysArePure {c m : Nat} : ClassElems c m → Bool
+/-- Whether the members of a class body can be defined without an
+observable effect, which is what decides whether declaring the class has
+one.  The body of a method is not run, so only its key matters; a decorator
+*is* run, and so is a static block and the initialiser of a static field,
+while the initialiser of an instance field runs when an instance is built
+and not when the class is defined. -/
+def ClassElems.keysArePure {c m : Nat} : ClassElems exprExt targetExt c m → Bool
   | .nil => true
-  | .cons (.mk _ _ key _ _) r => PropName.isPure key && ClassElems.keysArePure r
+  | .cons (.method ds _ _ key _ _ _) r =>
+      Exprs.isNil ds && PropName.isPure key && ClassElems.keysArePure r
+  | .cons (.field ds isStatic key init) r =>
+      Exprs.isNil ds && PropName.isPure key && (!isStatic || init.isPure)
+        && ClassElems.keysArePure r
+  | .cons (.staticBlock _) _ => false
 
 /-! ## Folding an operator -/
 
@@ -223,7 +237,7 @@ private def ofUint32 (n : Nat) : Int :=
 private def isSafe (v : Int) : Bool := v.natAbs ≤ maxSafeInteger.toNat
 
 /-- The value of `a op b`, when it is one the optimizer computes. -/
-def foldBinary (a : Lit) (op : MiniBinOp) (b : Lit) : Option Lit :=
+def foldBinary (a : Lit) (op : BinOp) (b : Lit) : Option Lit :=
   match op, a, b with
   -- arithmetic
   | .plus, .num x, .num y => if isSafe (x + y) then some (.num (x + y)) else none
@@ -279,7 +293,7 @@ where
     | _, _ => false
 
 /-- The value of `op a`, when it is one the optimizer computes. -/
-def foldUnary (op : MiniUnaryOp) (a : Lit) : Option Lit :=
+def foldUnary (op : UnaryOp) (a : Lit) : Option Lit :=
   match op, a with
   | .not, v => some (.bool (!v.truthy))
   | .minus, .num v => if isSafe (-v) then some (.num (-v)) else none
@@ -293,12 +307,63 @@ def foldUnary (op : MiniUnaryOp) (a : Lit) : Option Lit :=
 
 /-- The result of `typeof e` for the expressions whose type is known
 without evaluating them. -/
-def typeofOf? {c m : Nat} : Expr c m → Option String
-  | .arrow _ _ | .func _ _ _ _ | .funcSelf _ _ _ _
-  | .classAnon _ _ | .classSelf _ _ => some "function"
+def typeofOf? {c m : Nat} : Expr exprExt targetExt c m → Option String
+  | .arrow _ _ _ | .func _ _ _ _ _ | .funcSelf _ _ _ _ _
+  | .classAnon _ _ _ | .classSelf _ _ _ => some "function"
   | e => (litOf? e).bind fun v => (foldUnary .typeof v).bind fun
       | .str s => some s
       | _ => none
+
+/-! ## Folding a call on a regular expression
+
+A regular expression literal is matched by the `lean-regex` library
+(`Language.JavaScript.RegExpEngine`), whose engines are proved correct, so a
+call whose receiver, pattern and arguments are all literals can be computed
+here.
+
+The conditions are deliberately narrow, and a call which does not meet them
+is left alone:
+
+* the pattern has to be one the library reads, and its flags ones under
+  which a search means what the library's search means — `RegExpLit.test?`
+  and friends answer `none` otherwise;
+* the pattern, the subject and the replacement have to be ASCII, as they do
+  for a comparison of two strings: JavaScript matches over UTF-16 code
+  units and the library over `Char`, and the two agree there;
+* a replacement may not contain a `$`, which JavaScript reads as a reference
+  to a capture group and the library does not;
+* `replaceAll` is folded only for a global literal, since JavaScript throws
+  a `TypeError` for a non-global one.
+
+A fresh literal has a `lastIndex` of `0` and is thrown away right after the
+call, so the `g` flag does not make the value of the call depend on
+anything: what `g` selects is whether `replace` replaces one match or all of
+them.  As everywhere else in this pass, the value is the one JavaScript
+computes as long as the prototypes are the standard ones, which
+`optimizeProgramChecked` refuses a program that changes. -/
+
+/-- The value of a call on a regular expression literal, when the optimizer
+computes it.  `callee` and `args` are already optimized. -/
+def foldRegexCall? {c m : Nat} (callee : Expr exprExt targetExt c m) (args : Exprs exprExt targetExt c m) :
+    Option (Expr exprExt targetExt c m) :=
+  match callee, args with
+  -- `/re/.test("s")`
+  | .dot (.regex r) name, .cons (.string s) .nil =>
+      if name.val == "test" && isAscii r.source.val && isAscii s then
+        match r.test? s with
+        | some true => some .true_
+        | some false => some .false_
+        | none => none
+      else none
+  -- `"s".replace(/re/, "t")` and `"s".replaceAll(/re/g, "t")`
+  | .dot (.string s) name, .cons (.regex r) (.cons (.string repl) .nil) =>
+      if isAscii r.source.val && isAscii s && isAscii repl && !repl.contains '$' then
+        if name.val == "replace" then (r.replaceJS? s repl).map .string
+        else if name.val == "replaceAll" && r.flags.global then
+          (r.compiled?).map fun cr => .string (cr.replaceAll s repl)
+        else none
+      else none
+  | _, _ => none
 
 /-! ## The pass
 
@@ -307,22 +372,21 @@ in the same scope: what the optimizer produces is scope correct by
 construction. -/
 
 /-- What is to be done with a statement of a block. -/
-inductive StmtOpt (c m dc dm : Nat) where
+inductive StmtOpt (exprExt targetExt : Nat → Nat → Type) (c m dc dm : Nat) where
   /-- Keep it, rewritten. -/
-  | keep (stmt : Stmt c m dc dm)
+  | keep (stmt : Stmt exprExt targetExt c m dc dm)
   /-- Drop it; it binds nothing, so the rest of the block stays in scope. -/
   | drop (hc : dc = 0) (hm : dm = 0)
   /-- Keep it, and drop everything that follows it in the block. -/
-  | terminator (stmt : Stmt c m dc dm)
+  | terminator (stmt : Stmt exprExt targetExt c m dc dm)
 
-/-- A statement is one of the possible answers, which is what `optStmt`
-needs for Lean to accept it as a `partial` definition. -/
-instance {c m dc dm : Nat} [Inhabited (Stmt c m dc dm)] : Inhabited (StmtOpt c m dc dm) :=
+/-- A statement is one of the possible answers. -/
+instance {c m dc dm : Nat} [Inhabited (Stmt exprExt targetExt c m dc dm)] : Inhabited (StmtOpt exprExt targetExt c m dc dm) :=
   ⟨.keep default⟩
 
 /-- The one statement of a block, when it has exactly one and it binds
 nothing — in which case the block is the same thing as the statement. -/
-def Block.single? {c m : Nat} : Block c m → Option (Stmt c m 0 0)
+def Block.single? {c m : Nat} : Block exprExt targetExt c m → Option (Stmt exprExt targetExt c m 0 0)
   | .cons (.expr e) .nil => some (.expr e)
   | .cons (.block b) .nil => some (.block b)
   | .cons (.if_ cond t e) .nil => some (.if_ cond t e)
@@ -335,21 +399,21 @@ def Block.single? {c m : Nat} : Block c m → Option (Stmt c m 0 0)
   | .cons (.throw e) .nil => some (.throw e)
   | .cons (.break_ l) .nil => some (.break_ l)
   | .cons (.continue_ l) .nil => some (.continue_ l)
-  | .cons (.labelled l s) .nil => some (.labelled l s)
+  | .cons (.labelled (dc := 0) (dm := 0) l s) .nil => some (.labelled l s)
   | .cons (.switch disc cases) .nil => some (.switch disc cases)
   | .cons (.try_ b tail) .nil => some (.try_ b tail)
   | _ => none
 
 /-- Whether a statement transfers control, so that what follows it in its
 block cannot be reached. -/
-def Stmt.isTerminator {c m dc dm : Nat} : Stmt c m dc dm → Bool
+def Stmt.isTerminator {c m dc dm : Nat} : Stmt exprExt targetExt c m dc dm → Bool
   | .return_ _ | .throw _ | .break_ _ | .continue_ _ => true
   | _ => false
 
 /-- What a block amounts to as a statement: nothing when it is empty, the
 statement itself when it has exactly one that binds nothing, and a block
 otherwise. -/
-def blockAsStmt {c m : Nat} (b : Block c m) : StmtOpt c m 0 0 :=
+def blockAsStmt {c m : Nat} (b : Block exprExt targetExt c m) : StmtOpt exprExt targetExt c m 0 0 :=
   match b with
   | .nil => .drop rfl rfl
   | b =>
@@ -360,29 +424,45 @@ def blockAsStmt {c m : Nat} (b : Block c m) : StmtOpt c m 0 0 :=
 mutual
 
 /-- Optimize an expression. -/
-partial def optExpr {c m : Nat} (e : Expr c m) : Expr c m :=
+def optExpr {c m : Nat} (e : Expr exprExt targetExt c m) : Expr exprExt targetExt c m :=
   match e with
   | .mutVar i => .mutVar i
   | .constVar i => .constVar i
-  | .unsafeGlobal n => .unsafeGlobal n
-  | .number raw => .number raw
+  | .unsafeExt e => .unsafeExt e
+  | .number n => .number n
   | .string v => .string v
-  | .regex raw => .regex raw
+  | .regex r => .regex r
   | .null => .null
   | .true_ => .true_
   | .false_ => .false_
   | .this => .this
+  | .superDot n => .superDot n
+  | .superIndex i => .superIndex (optExpr i)
+  | .superCall args => .superCall (optExprs args)
+  | .newTarget => .newTarget
   | .array els => .array (optArrayElems els)
   | .object ps => .object (optProperties ps)
   | .assign t op rhs => .assign (optTarget t) op (optExpr rhs)
   | .update t op isPrefix => .update (optTarget t) op isPrefix
   | .await x => .await (optExpr x)
-  | .call f args => .call (optExpr f) (optExprs args)
+  | .call f args =>
+      let f := optExpr f
+      let args := optExprs args
+      match foldRegexCall? f args with
+      | some v => v
+      | none => .call f args
   | .new f args => .new (optExpr f) (optExprs args)
   | .dot o n => .dot (optExpr o) n
   | .index o i => .index (optExpr o) (optExpr i)
-  | .classAnon her body => .classAnon (optOptExpr her) (optClassElems body)
-  | .classSelf her body => .classSelf (optOptExpr her) (optClassElems body)
+  | .privateDot o n => .privateDot (optExpr o) n
+  | .privateName n => .privateName n
+  | .chain base hd tl => .chain (optExpr base) (optChainLink hd) (optChainLinks tl)
+  | .importMeta => .importMeta
+  | .importCall spec opts => .importCall (optExpr spec) (optOptExpr opts)
+  | .classAnon ds her body =>
+      .classAnon (optExprs ds) (optOptExpr her) (optClassElems body)
+  | .classSelf ds her body =>
+      .classSelf (optExprs ds) (optOptExpr her) (optClassElems body)
   | .seq a b =>
       let a := optExpr a
       let b := optExpr b
@@ -399,6 +479,13 @@ partial def optExpr {c m : Nat} (e : Expr c m) : Expr c m :=
           match litOf? a with
           | some v => if v.truthy then a else b
           | none => .binary a op b
+      | .coalesce =>
+          -- `null ?? b` is `b`; any other literal is not nullish, so it is
+          -- the value of the whole expression
+          match litOf? a with
+          | some .null => b
+          | some _ => a
+          | none => .binary a op b
       | _ =>
           match litOf? a, litOf? b with
           | some x, some y =>
@@ -413,9 +500,11 @@ partial def optExpr {c m : Nat} (e : Expr c m) : Expr c m :=
       match litOf? cond with
       | some v => if v.truthy then t else f
       | none => .ternary cond t f
-  | .arrow arity body => .arrow arity (optArrowBody body)
-  | .func isAsync isGen arity body => .func isAsync isGen arity (optBlock body)
-  | .funcSelf isAsync isGen arity body => .funcSelf isAsync isGen arity (optBlock body)
+  | .arrow arity hasRest body => .arrow arity hasRest (optArrowBody body)
+  | .func isAsync isGen hasRest arity body =>
+      .func isAsync isGen hasRest arity (optBlock body)
+  | .funcSelf isAsync isGen hasRest arity body =>
+      .funcSelf isAsync isGen hasRest arity (optBlock body)
   | .spread x => .spread (optExpr x)
   | .template tag head parts => .template (optOptExpr tag) head (optTemplateParts parts)
   | .unary op x =>
@@ -436,96 +525,120 @@ partial def optExpr {c m : Nat} (e : Expr c m) : Expr c m :=
   | .yieldFrom x => .yieldFrom (optExpr x)
 
 /-- Optimize an assignment target. -/
-partial def optTarget {c m : Nat} : Target c m → Target c m
+def optTarget {c m : Nat} : Target exprExt targetExt c m → Target exprExt targetExt c m
   | .mut i => .mut i
-  | .unsafeGlobal n => .unsafeGlobal n
+  | .unsafeExt e => .unsafeExt e
   | .dot o n => .dot (optExpr o) n
+  | .privateDot o n => .privateDot (optExpr o) n
+  | .superDot n => .superDot n
+  | .superIndex i => .superIndex (optExpr i)
   | .index o i => .index (optExpr o) (optExpr i)
 
+/-- Optimize one link of an optional chain. -/
+def optChainLink {c m : Nat} : ChainLink exprExt targetExt c m → ChainLink exprExt targetExt c m
+  | .dot opt n => .dot opt n
+  | .privateDot opt n => .privateDot opt n
+  | .index opt i => .index opt (optExpr i)
+  | .call opt args => .call opt (optExprs args)
+
+/-- Optimize the links of an optional chain. -/
+def optChainLinks {c m : Nat} : ChainLinks exprExt targetExt c m → ChainLinks exprExt targetExt c m
+  | .nil => .nil
+  | .cons hd tl => .cons (optChainLink hd) (optChainLinks tl)
+
 /-- Optimize a list of expressions. -/
-partial def optExprs {c m : Nat} : Exprs c m → Exprs c m
+def optExprs {c m : Nat} : Exprs exprExt targetExt c m → Exprs exprExt targetExt c m
   | .nil => .nil
   | .cons e r => .cons (optExpr e) (optExprs r)
 
 /-- Optimize an optional expression. -/
-partial def optOptExpr {c m : Nat} : OptExpr c m → OptExpr c m
+def optOptExpr {c m : Nat} : OptExpr exprExt targetExt c m → OptExpr exprExt targetExt c m
   | .none => .none
   | .some e => .some (optExpr e)
 
 /-- Optimize the elements of an array literal. -/
-partial def optArrayElems {c m : Nat} : ArrayElems c m → ArrayElems c m
+def optArrayElems {c m : Nat} : ArrayElems exprExt targetExt c m → ArrayElems exprExt targetExt c m
   | .nil => .nil
   | .cons .hole r => .cons .hole (optArrayElems r)
   | .cons (.elem e) r => .cons (.elem (optExpr e)) (optArrayElems r)
 
 /-- Optimize the substitutions of a template literal. -/
-partial def optTemplateParts {c m : Nat} : TemplateParts c m → TemplateParts c m
+def optTemplateParts {c m : Nat} : TemplateParts exprExt targetExt c m → TemplateParts exprExt targetExt c m
   | .nil => .nil
   | .cons (.mk e s) r => .cons (.mk (optExpr e) s) (optTemplateParts r)
 
 /-- Optimize the name of a property. -/
-partial def optPropName {c m : Nat} : PropName c m → PropName c m
+def optPropName {c m : Nat} : PropName exprExt targetExt c m → PropName exprExt targetExt c m
   | .ident n => .ident n
+  | .private_ n => .private_ n
   | .string v => .string v
   | .number raw => .number raw
   | .computed e => .computed (optExpr e)
 
 /-- Optimize the members of an object literal. -/
-partial def optProperties {c m : Nat} : Properties c m → Properties c m
+def optProperties {c m : Nat} : Properties exprExt targetExt c m → Properties exprExt targetExt c m
   | .nil => .nil
   | .cons (.keyValue k v) r => .cons (.keyValue (optPropName k) (optExpr v)) (optProperties r)
-  | .cons (.method kind k arity body) r =>
-      .cons (.method kind (optPropName k) arity (optBlock body)) (optProperties r)
+  | .cons (.spread e) r => .cons (.spread (optExpr e)) (optProperties r)
+  | .cons (.method kind k arity hasRest body) r =>
+      .cons (.method kind (optPropName k) arity hasRest (optBlock body)) (optProperties r)
 
 /-- Optimize the members of a class body. -/
-partial def optClassElems {c m : Nat} : ClassElems c m → ClassElems c m
+def optClassElems {c m : Nat} : ClassElems exprExt targetExt c m → ClassElems exprExt targetExt c m
   | .nil => .nil
-  | .cons (.mk isStatic kind k arity body) r =>
-      .cons (.mk isStatic kind (optPropName k) arity (optBlock body)) (optClassElems r)
+  | .cons (.method ds isStatic kind k arity hasRest body) r =>
+      .cons (.method (optExprs ds) isStatic kind (optPropName k) arity hasRest (optBlock body))
+        (optClassElems r)
+  | .cons (.field ds isStatic k init) r =>
+      .cons (.field (optExprs ds) isStatic (optPropName k) (optOptExpr init)) (optClassElems r)
+  | .cons (.staticBlock body) r => .cons (.staticBlock (optBlock body)) (optClassElems r)
 
 /-- Optimize the body of an arrow function. -/
-partial def optArrowBody {c m : Nat} : ArrowBody c m → ArrowBody c m
+def optArrowBody {c m : Nat} : ArrowBody exprExt targetExt c m → ArrowBody exprExt targetExt c m
   | .expr e => .expr (optExpr e)
   | .block b => .block (optBlock b)
 
 /-- Optimize the first clause of a `for (;;)`. -/
-partial def optForInit {c m dc dm : Nat} : ForInit c m dc dm → ForInit c m dc dm
+def optForInit {c m dc dm : Nat} : ForInit exprExt targetExt c m dc dm → ForInit exprExt targetExt c m dc dm
   | .none => .none
   | .expr e => .expr (optExpr e)
   | .constDecl init => .constDecl (optExpr init)
   | .letDecl init => .letDecl (optOptExpr init)
 
 /-- Optimize the binder of a `for (... of ...)`. -/
-partial def optForHead {c m dc dm : Nat} : ForHead c m dc dm → ForHead c m dc dm
+def optForHead {c m dc dm : Nat} : ForHead exprExt targetExt c m dc dm → ForHead exprExt targetExt c m dc dm
   | .target t => .target (optTarget t)
   | .constBind => .constBind
   | .letBind => .letBind
 
 /-- Optimize the cases of a `switch`. -/
-partial def optSwitchCases {c m : Nat} : SwitchCases c m → SwitchCases c m
+def optSwitchCases {c m : Nat} : SwitchCases exprExt targetExt c m → SwitchCases exprExt targetExt c m
   | .nil => .nil
   | .cons (.case t b) r => .cons (.case (optExpr t) (optBlock b)) (optSwitchCases r)
   | .cons (.default b) r => .cons (.default (optBlock b)) (optSwitchCases r)
 
 /-- Optimize an optional block. -/
-partial def optOptBlock {c m : Nat} : OptBlock c m → OptBlock c m
+def optOptBlock {c m : Nat} : OptBlock exprExt targetExt c m → OptBlock exprExt targetExt c m
   | .none => .none
   | .some b => .some (optBlock b)
 
 /-- Optimize what follows the block of a `try`. -/
-partial def optTryTail {c m : Nat} : TryTail c m → TryTail c m
+def optTryTail {c m : Nat} : TryTail exprExt targetExt c m → TryTail exprExt targetExt c m
   | .catch_ body fin => .catch_ (optBlock body) (optOptBlock fin)
   | .finallyOnly b => .finallyOnly (optBlock b)
 
 /-- Optimize a statement, and say whether it can be dropped, or makes the
 statements that follow it unreachable. -/
-partial def optStmt {c m dc dm : Nat} (s : Stmt c m dc dm) : StmtOpt c m dc dm :=
+def optStmt {c m dc dm : Nat} (s : Stmt exprExt targetExt c m dc dm) : StmtOpt exprExt targetExt c m dc dm :=
   match s with
   | .expr e =>
       let e := optExpr e
       if e.isPure then .drop rfl rfl else .keep (.expr e)
   | .constDecl init => .keep (.constDecl (optExpr init))
   | .letDecl init => .keep (.letDecl (optOptExpr init))
+  -- a `using` binding is never dropped: disposing of what it holds is
+  -- what it is written for
+  | .usingDecl isAwait init => .keep (.usingDecl isAwait (optExpr init))
   | .block b => blockAsStmt (optBlock b)
   | .if_ cond thenB elseB =>
       let cond := optExpr cond
@@ -552,9 +665,10 @@ partial def optStmt {c m dc dm : Nat} (s : Stmt c m dc dm) : StmtOpt c m dc dm :
       .keep (.for_ (optForInit init) (optOptExpr cond) (optOptExpr step) (optBlock body))
   | .forIn head obj body => .keep (.forIn (optForHead head) (optExpr obj) (optBlock body))
   | .forOf head obj body => .keep (.forOf (optForHead head) (optExpr obj) (optBlock body))
-  | .funcDecl isAsync isGen arity body =>
-      .keep (.funcDecl isAsync isGen arity (optBlock body))
-  | .classDecl her body => .keep (.classDecl (optOptExpr her) (optClassElems body))
+  | .funcDecl isAsync isGen hasRest arity body =>
+      .keep (.funcDecl isAsync isGen hasRest arity (optBlock body))
+  | .classDecl ds her body =>
+      .keep (.classDecl (optExprs ds) (optOptExpr her) (optClassElems body))
   | .return_ e => .terminator (.return_ (optOptExpr e))
   | .throw e => .terminator (.throw (optExpr e))
   | .break_ l => .terminator (.break_ l)
@@ -563,18 +677,21 @@ partial def optStmt {c m dc dm : Nat} (s : Stmt c m dc dm) : StmtOpt c m dc dm :
       match optStmt s' with
       | .keep s'' => .keep (.labelled l s'')
       | .terminator s'' => .keep (.labelled l s'')
-      | .drop _ _ => .drop rfl rfl
+      | .drop hc hm => .drop hc hm
   | .switch disc cases => .keep (.switch (optExpr disc) (optSwitchCases cases))
   | .try_ b tail => .keep (.try_ (optBlock b) (optTryTail tail))
 
 /-- Optimize a block: every statement, dropping the ones without effect,
 the bindings nothing uses, and everything after a statement that transfers
 control. -/
-partial def optBlock {c m : Nat} : Block c m → Block c m
+def optBlock {c m : Nat} : Block exprExt targetExt c m → Block exprExt targetExt c m
   | .nil => .nil
   | .cons hd tl =>
       match optStmt hd with
-      | .drop hc hm => optBlock (tl.castScope (by omega) (by omega))
+      -- the tail is optimized first and the (identical) scopes are matched
+      -- up afterwards, so that the recursive call is on the tail itself
+      | .drop hc hm =>
+          Block.castScope (by omega) (by omega) (optBlock tl)
       | .terminator s => .cons s .nil
       | .keep s =>
           match s, tl with
@@ -584,19 +701,21 @@ partial def optBlock {c m : Nat} : Block c m → Block c m
           | .letDecl init, tl =>
               let rest := optBlock tl
               dropUnusedMut (.letDecl init) init.isPure rest
-          | .funcDecl isAsync isGen arity body, tl =>
+          | .funcDecl isAsync isGen hasRest arity body, tl =>
               let rest := optBlock tl
-              dropUnusedConst (.funcDecl isAsync isGen arity body) true rest
-          | .classDecl her body, tl =>
+              dropUnusedConst (.funcDecl isAsync isGen hasRest arity body) true rest
+          | .classDecl ds her body, tl =>
               let rest := optBlock tl
-              dropUnusedConst (.classDecl her body)
-                (match her with | .none => body.keysArePure | .some _ => false) rest
+              dropUnusedConst (.classDecl ds her body)
+                (match ds, her with
+                  | .nil, .none => body.keysArePure
+                  | _, _ => false) rest
           | s, tl => .cons s (optBlock tl)
 
 /-- Drop a statement that binds one const variable, when defining it has no
 effect and the rest of the block does not use it. -/
-partial def dropUnusedConst {c m : Nat} (s : Stmt c m 1 0) (defPure : Bool) (rest : Block (c + 1) m) :
-    Block c m :=
+def dropUnusedConst {c m : Nat} (s : Stmt exprExt targetExt c m 1 0) (defPure : Bool) (rest : Block exprExt targetExt (c + 1) m) :
+    Block exprExt targetExt c m :=
   if defPure then
     match strengthenConstBlock 0 rest with
     | some b => b
@@ -605,8 +724,8 @@ partial def dropUnusedConst {c m : Nat} (s : Stmt c m 1 0) (defPure : Bool) (res
 
 /-- Drop a statement that binds one mutable variable, when its initializer
 has no effect and the rest of the block does not use it. -/
-partial def dropUnusedMut {c m : Nat} (s : Stmt c m 0 1) (defPure : Bool) (rest : Block c (m + 1)) :
-    Block c m :=
+def dropUnusedMut {c m : Nat} (s : Stmt exprExt targetExt c m 0 1) (defPure : Bool) (rest : Block exprExt targetExt c (m + 1)) :
+    Block exprExt targetExt c m :=
   if defPure then
     match strengthenMutBlock 0 rest with
     | some b => b
@@ -620,16 +739,18 @@ end
 /-- Optimize a top level item that is not a statement; an `import` or an
 `export` is left alone, since what a module exports is part of what it
 does. -/
-def optModuleItem {c m dc dm : Nat} (it : ModuleItem c m dc dm) : ModuleItem c m dc dm :=
+def optModuleItem {c m dc dm : Nat} (it : ModuleItem exprExt targetExt c m dc dm) : ModuleItem exprExt targetExt c m dc dm :=
   match it with
   | .stmt s =>
       match optStmt s with
       | .keep s' => .stmt s'
       | .terminator s' => .stmt s'
       | .drop _ _ => .stmt s
-  | .importBare mod => .importBare mod
+  | .importBare mod attrs => .importBare mod attrs
   | .importClause clause => .importClause clause
-  | .exportFrom specs mod => .exportFrom specs mod
+  | .exportFrom specs mod attrs => .exportFrom specs mod attrs
+  | .exportAll alias_ mod attrs => .exportAll alias_ mod attrs
+  | .exportDefaultExpr e => .exportDefaultExpr (optExpr e)
   | .exportLocals specs => .exportLocals specs
   | .exportDecl s =>
       match optStmt s with
@@ -640,7 +761,7 @@ def optModuleItem {c m dc dm : Nat} (it : ModuleItem c m dc dm) : ModuleItem c m
 /-- Optimize the top level items.  A statement without effect is dropped
 here too, but nothing that *follows* one is: a module is not left by a
 `return`, and an `export` is never dropped. -/
-partial def optModuleItems {c m : Nat} : ModuleItems c m → ModuleItems c m
+def optModuleItems {c m : Nat} : ModuleItems exprExt targetExt c m → ModuleItems exprExt targetExt c m
   | .nil => .nil
   | .cons it r =>
       match it with
@@ -648,17 +769,19 @@ partial def optModuleItems {c m : Nat} : ModuleItems c m → ModuleItems c m
           match optStmt s with
           | .keep s' => .cons (.stmt s') (optModuleItems r)
           | .terminator s' => .cons (.stmt s') (optModuleItems r)
-          | .drop hc hm => optModuleItems (r.castScope (by omega) (by omega))
+          | .drop hc hm =>
+              ModuleItems.castScope (by omega) (by omega) (optModuleItems r)
       | it => .cons (optModuleItem it) (optModuleItems r)
 
-/-- Optimize a program: one bottom up pass. -/
-def optimizeProgram (p : Program) : Program := ⟨optModuleItems p.items⟩
+/-- Optimize a program: one bottom up pass.  The optimizer never invents a
+global, so the set of globals of the result is the one of the input. -/
+def optimizeProgram (p : Program) : Program := ⟨p.globals, optModuleItems p.items⟩
 
 /-- Optimize an expression: one bottom up pass. -/
-def optimizeExpr {c m : Nat} (e : Expr c m) : Expr c m := optExpr e
+def optimizeExpr {c m : Nat} (e : Expr exprExt targetExt c m) : Expr exprExt targetExt c m := optExpr e
 
 /-- Optimize a block of statements: one bottom up pass. -/
-def optimizeBlock {c m : Nat} (b : Block c m) : Block c m := optBlock b
+def optimizeBlock {c m : Nat} (b : Block exprExt targetExt c m) : Block exprExt targetExt c m := optBlock b
 
 /-- Optimize a program repeatedly, until a pass changes nothing or `fuel`
 passes have been run.  One pass already folds bottom up, so this only helps

@@ -49,9 +49,25 @@ inductive Mode where
   | flat | broken
 deriving Inhabited, BEq
 
+/-- The size of a document: one for each of its nodes.  Laying out a
+document replaces a node of the work list by its children, so the sum of the
+sizes of the work list decreases at every step; this is what makes `fits`
+and `go` terminating rather than `partial`. -/
+def size : Doc → Nat
+  | .nil | .text _ | .line | .softline | .hardline => 1
+  | .cat a b => size a + size b + 1
+  | .nest _ d => size d + 1
+  | .group d => size d + 1
+  | .ifBreak b f => size b + size f + 1
+
+/-- The size of a work list. -/
+def itemsSize : List (Nat × Mode × Doc) → Nat
+  | [] => 0
+  | (_, _, d) :: rest => d.size + itemsSize rest
+
 /-- Would the pending documents fit into `width` more columns, up to the
 first line break of a broken group? -/
-partial def fits (width : Int) (items : List (Nat × Mode × Doc)) : Bool :=
+def fits (width : Int) (items : List (Nat × Mode × Doc)) : Bool :=
   if width < 0 then false else
   match items with
   | [] => true
@@ -75,15 +91,17 @@ partial def fits (width : Int) (items : List (Nat × Mode × Doc)) : Bool :=
     | .ifBreak b f => match m with
       | .flat => fits width ((i, m, f) :: rest)
       | .broken => fits width ((i, m, b) :: rest)
+termination_by itemsSize items
+decreasing_by all_goals (simp only [itemsSize, size]; omega)
 
 /-- The column reached after emitting `s` starting at column `col`. -/
 private def columnAfter (col : Nat) (s : String) : Nat :=
   s.foldl (fun c ch => if ch == '\n' then 0 else c + 1) col
 
 private def newlineWith (indent : Nat) : String :=
-  "\n" ++ String.ofList (List.replicate indent ' ')
+  String.pushn "\n" ' ' indent
 
-private partial def go (width : Nat) (out : String) (col : Nat) :
+private def go (width : Nat) (out : String) (col : Nat) :
     List (Nat × Mode × Doc) → String
   | [] => out
   | (i, m, d) :: rest =>
@@ -105,6 +123,8 @@ private partial def go (width : Nat) (out : String) (col : Nat) :
     | .ifBreak b f => match m with
       | .flat => go width out col ((i, m, f) :: rest)
       | .broken => go width out col ((i, m, b) :: rest)
+termination_by items => itemsSize items
+decreasing_by all_goals (simp only [itemsSize, size]; omega)
 
 /-- Lay out a document, breaking groups that do not fit into `width`
 columns. -/

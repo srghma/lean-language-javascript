@@ -1,11 +1,11 @@
 /-
-Port of `LanguageJavaScript.Parser.SrcLocation` to Lean 4.
+Port of `Language.JavaScript.Parser.SrcLocation` to Lean 4.
 
 Source positions carried by the lexer tokens and, through them, by the
 annotations stored in the AST.
 -/
 
-namespace LanguageJavaScript.Parser
+namespace Language.JavaScript.Parser
 
 /-- A source position: byte offset, line (1 based) and column (1 based). -/
 structure TokenPosn where
@@ -33,4 +33,4 @@ abbrev TokenPn (offset line column : Nat) : TokenPosn := ⟨offset, line, column
 /-- `tokenPosnEmpty` of the Haskell library. -/
 abbrev tokenPosnEmpty : TokenPosn := TokenPosn.empty
 
-end LanguageJavaScript.Parser
+end Language.JavaScript.Parser

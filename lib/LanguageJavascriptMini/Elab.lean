@@ -20,6 +20,7 @@ and the comments of the embedded source are gone by construction.
 import Lean
 import LanguageJavascriptMini.AST
 import LanguageJavascriptMini.Printer
+import LanguageJavascriptMini.OfFull
 
 namespace Language.JavaScript.MiniAST
 
@@ -37,17 +38,22 @@ instance : ToExpr NEString where
   toTypeExpr := mkConst ``NEString
 
 deriving instance ToExpr for NEList
-deriving instance ToExpr for MiniBinOp
-deriving instance ToExpr for MiniUnaryOp
-deriving instance ToExpr for MiniPostfixOp
-deriving instance ToExpr for MiniAssignOp
-deriving instance ToExpr for MiniVarKind
-deriving instance ToExpr for MiniMethodKind
-deriving instance ToExpr for MiniSpecifier
+deriving instance ToExpr for NumBase
+deriving instance ToExpr for JSNumber
+deriving instance ToExpr for RegExpFlags
+deriving instance ToExpr for RegExpLit
+deriving instance ToExpr for BinOp
+deriving instance ToExpr for UnaryOp
+deriving instance ToExpr for PostfixOp
+deriving instance ToExpr for AssignOp
+deriving instance ToExpr for VarKind
+deriving instance ToExpr for MethodKind
+deriving instance ToExpr for Specifier
+deriving instance ToExpr for ImportAttr
 
 instance : ToExpr MiniImportClause where
   toExpr c := mkAppN (mkConst ``MiniImportClause.mk!)
-    #[toExpr c.default_, toExpr c.namespace_, toExpr c.named, toExpr c.mod]
+    #[toExpr c.default_, toExpr c.namespace_, toExpr c.named, toExpr c.mod, toExpr c.attrs]
   toTypeExpr := mkConst ``MiniImportClause
 
 deriving instance ToExpr for MiniImportDeclaration
@@ -70,15 +76,40 @@ open Lean.Parser
 /-- What ends an embedded JavaScript fragment. -/
 def endMarker : String := "|end_js]"
 
-private partial def markerAt (c : ParserContext) (pos : String.Pos.Raw) : List Char → Bool
-  | [] => true
-  | ch :: rest => !c.atEnd pos && c.get pos == ch && markerAt c (c.next pos) rest
+/-- Whether the terminator is written at `pos`.  Both the input and the
+terminator are read by byte index: the terminator is not turned into a list
+of characters, which this used to do once per position scanned.
 
-private partial def scanToMarker (c : ParserContext) (s : ParserState) (pos : String.Pos.Raw) :
-    ParserState :=
-  if markerAt c pos endMarker.toList then s.setPos pos
-  else if c.atEnd pos then s.mkErrorAt "'|end_js]'" pos
+The walk over the terminator is well founded on the bytes of it that are
+still to be matched. -/
+private def markerAt (c : ParserContext) (pos : String.Pos.Raw)
+    (mpos : String.Pos.Raw) : Bool :=
+  if _h : endMarker.utf8ByteSize ≤ mpos.byteIdx then true
+  else
+    !c.atEnd pos && c.get pos == String.Pos.Raw.get endMarker mpos &&
+      markerAt c (c.next pos) (String.Pos.Raw.next endMarker mpos)
+termination_by endMarker.utf8ByteSize - mpos.byteIdx
+decreasing_by
+  have := String.Pos.Raw.byteIdx_lt_byteIdx_next endMarker mpos
+  omega
+
+/-- Scan forward to the terminator.  The scan is well founded on the number
+of bytes of the input which are still to be read: it stops at the end of the
+input, and every step reads a character.  There is no step counter, so the
+scan does not have to be told how long its input is. -/
+private def scanToMarker (c : ParserContext) (s : ParserState)
+    (pos : String.Pos.Raw) : ParserState :=
+  if markerAt c pos ⟨0⟩ then s.setPos pos
+  else if _h : c.atEnd pos then s.mkErrorAt "'|end_js]'" pos
   else scanToMarker c s (c.next pos)
+termination_by c.endPos.byteIdx - pos.byteIdx
+decreasing_by
+  have hlt : pos.byteIdx < c.endPos.byteIdx := by
+    simp only [Lean.Parser.InputContext.atEnd, decide_eq_true_eq, ge_iff_le,
+      String.Pos.Raw.le_iff] at _h
+    omega
+  have hnext : pos.byteIdx < (c.next pos).byteIdx := String.Pos.Raw.byteIdx_lt_byteIdx_next c.inputString pos
+  omega
 
 /-- Consume the source text up to, but not including, the terminator. -/
 def jsBodyFn : ParserFn := fun c s => scanToMarker c s s.pos

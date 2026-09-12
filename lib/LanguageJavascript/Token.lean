@@ -1,5 +1,5 @@
 /-
-Port of `LanguageJavaScript.Parser.Token` to Lean 4.
+Port of `Language.JavaScript.Parser.Token` to Lean 4.
 
 In the Haskell original, `Token` is a large sum type where every constructor
 carries a source span, (sometimes) a literal and a list of comment
@@ -9,7 +9,7 @@ build and to pattern match on, while carrying exactly the same information.
 -/
 import LanguageJavascript.SrcLocation
 
-namespace LanguageJavaScript.Parser
+namespace Language.JavaScript.Parser
 
 -- Structural decidable equality for the raw substrings carried by comment
 -- annotations.  (Content equality is what `==` below uses; propositional
@@ -49,6 +49,8 @@ inductive TokenKind where
   | WsToken
   -- Identifiers
   | IdentifierToken
+  /-- A private class name, `#x`; the text includes the `#`. -/
+  | PrivateNameToken
   -- Javascript literals
   | DecimalToken
   | HexIntegerToken
@@ -128,6 +130,12 @@ inductive TokenKind where
   | AndAssignToken
   | XorAssignToken
   | OrAssignToken
+  /-- `&&=` -/
+  | LogicalAndAssignToken
+  /-- `||=` -/
+  | LogicalOrAssignToken
+  /-- `??=` -/
+  | NullishAssignToken
   | SimpleAssignToken
   | StrictNeToken
   | NeToken
@@ -150,6 +158,12 @@ inductive TokenKind where
   | ArrowToken
   | SpreadToken
   | DotToken
+  /-- `??` -/
+  | NullishToken
+  /-- `?.` -/
+  | OptionalChainToken
+  /-- `@`, which introduces a decorator. -/
+  | AtToken
   | LeftBracketToken
   | RightBracketToken
   | LeftCurlyToken
@@ -175,6 +189,7 @@ def name : TokenKind → String
   | CommentToken => "CommentToken"
   | WsToken => "WsToken"
   | IdentifierToken => "IdentifierToken"
+  | PrivateNameToken => "PrivateNameToken"
   | DecimalToken => "DecimalToken"
   | HexIntegerToken => "HexIntegerToken"
   | OctalToken => "OctalToken"
@@ -249,6 +264,9 @@ def name : TokenKind → String
   | AndAssignToken => "AndAssignToken"
   | XorAssignToken => "XorAssignToken"
   | OrAssignToken => "OrAssignToken"
+  | LogicalAndAssignToken => "LogicalAndAssignToken"
+  | LogicalOrAssignToken => "LogicalOrAssignToken"
+  | NullishAssignToken => "NullishAssignToken"
   | SimpleAssignToken => "SimpleAssignToken"
   | StrictNeToken => "StrictNeToken"
   | NeToken => "NeToken"
@@ -271,6 +289,9 @@ def name : TokenKind → String
   | ArrowToken => "ArrowToken"
   | SpreadToken => "SpreadToken"
   | DotToken => "DotToken"
+  | NullishToken => "NullishToken"
+  | OptionalChainToken => "OptionalChainToken"
+  | AtToken => "AtToken"
   | LeftBracketToken => "LeftBracketToken"
   | RightBracketToken => "RightBracketToken"
   | LeftCurlyToken => "LeftCurlyToken"
@@ -310,4 +331,4 @@ def debugTokenString (t : Token) : String := t.kind.name
 
 end Token
 
-end LanguageJavaScript.Parser
+end Language.JavaScript.Parser

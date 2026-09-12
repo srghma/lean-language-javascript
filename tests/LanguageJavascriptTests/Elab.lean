@@ -65,14 +65,7 @@ def spec : Spec := do
   describe "Embedded JavaScript (MiniElab)" do
     it "a program elaborates to the tree its source denotes" do
       shouldEqual (Language.JavaScript.MiniAST.printProgram miniGreeter)
-        ("function greet(name) {\n  if (name) {\n    console.log(`hello ${name}`);\n  } else"
-          ++ " console.log(\"hi\");\n}\nconst xs = [1, 2, 3].map((x) => x * 2);\n" : String)
-        -- wait, let's use actual miniGreeter output:
-        -- "function greet(name) {
-  console.log(`hello ${name}`);
-}
-greet("world");
-"
+        "function greet(name) {\n  console.log(`hello ${name}`);\n}\ngreet(\"world\");\n"
     it "layout, comments and quoting are gone" do
       shouldEqual (toString (miniGreeter == miniGreeterAgain)) "true"
     it "and it is the tree the parser produces" do
@@ -109,11 +102,11 @@ greet("world");
       shouldEqual (Language.JavaScript.BrujinAST.printProgram [jsb| console.log(Math.max(1, 2)); |end_js])
         "console.log(Math.max(1, 2));\n"
     it "an expression in the empty scope" do
-      shouldEqual (Language.JavaScript.BrujinAST.printExpr [jsb_expr| 1 + 2 * 3 |end_js]) "1 + 2 * 3"
+      shouldEqual (Language.JavaScript.BrujinAST.printScopedExpr [jsb_expr| 1 + 2 * 3 |end_js]) "1 + 2 * 3"
     it "an expression in a scope of two const and one mutable variable" do
-      shouldEqual (Language.JavaScript.BrujinAST.printExprIndexed [jsb_expr 2 1| c#0 + l#0 * c#1 |end_js]) "c#0 + l#0 * c#1"
+      shouldEqual (Language.JavaScript.BrujinAST.printScopedExprIndexed [jsb_expr 2 1| c#0 + l#0 * c#1 |end_js]) "c#0 + l#0 * c#1"
     it "the same expression, with the level based names" do
-      shouldEqual (Language.JavaScript.BrujinAST.printExpr [jsb_expr 2 1| c#0 + l#0 * c#1 |end_js]) "_c1 + _m0 * _c0"
+      shouldEqual (Language.JavaScript.BrujinAST.printScopedExpr [jsb_expr 2 1| c#0 + l#0 * c#1 |end_js]) "_c1 + _m0 * _c0"
     it "c#0 inside a string is text" do
       shouldEqual (Language.JavaScript.BrujinAST.printProgram [jsb| console.log("c#0", `l#0`); // c#0
       |end_js])

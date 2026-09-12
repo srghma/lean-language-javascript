@@ -4,13 +4,14 @@ Port of the Haskell test module `ExpressionParser`.
 import Spec
 import LanguageJavascript.Parser
 import LanguageJavascript.AST
+import LanguageJavascript.ShowStripped
 
 namespace LanguageJavascriptTests.ExpressionParser
 
 open Spec
 open Spec.Assert
-open LanguageJavaScript.Parser
-open LanguageJavaScript.Parser.AST
+open Language.JavaScript.Parser
+open Language.JavaScript.Parser.AST
 
 def escapeLabel (s : String) : String :=
   s.replace "\n" "\\n" |>.replace "\r" "\\r"
@@ -164,7 +165,7 @@ def expressionCases : List (String × String) :=
   , ("x()[4]", "Right (JSAstExpression (JSCallExpressionSquare (JSMemberExpression (JSIdentifier 'x',JSArguments ()),JSDecimal '4')))")
   , ("x().x", "Right (JSAstExpression (JSCallExpressionDot (JSMemberExpression (JSIdentifier 'x',JSArguments ()),JSIdentifier 'x')))")
   , ("x(a,b=2).x", "Right (JSAstExpression (JSCallExpressionDot (JSMemberExpression (JSIdentifier 'x',JSArguments (JSIdentifier 'a',JSOpAssign ('=',JSIdentifier 'b',JSDecimal '2'))),JSIdentifier 'x')))")
-  , ("foo (56.8379100, 60.5806664)", "Right (JSAstExpression (JSMemberExpression (JSIdentifier 'foo',JSArguments (JSDecimal '56.8379100',JSDecimal '60.5806664'))))")
+  , ("foo (56.8379100, 60.5806664)", "Right (JSAstExpression (JSMemberExpression (JSIdentifier 'foo',JSArguments (JSDecimal '56.83791',JSDecimal '60.5806664'))))")
   -- spread expression
   , ("... x", "Right (JSAstExpression (JSSpreadExpression (JSIdentifier 'x')))")
   -- template literal

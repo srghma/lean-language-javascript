@@ -9,8 +9,8 @@ namespace LanguageJavascriptTests.RoundTrip
 
 open Spec
 open Spec.Assert
-open LanguageJavaScript.Parser
-open LanguageJavaScript.Pretty
+open Language.JavaScript.Parser
+open Language.JavaScript.Pretty
 
 def escapeLabel (s : String) : String :=
   s.replace "\n" "\\n" |>.replace "\r" "\\r"
@@ -23,9 +23,6 @@ def programCases : List String :=
   , "/*b*/false"
   , "true/*c*/"
   , "/*c*/true"
-  , "/*d*/0x1234fF"
-  , "/*e*/1.0e4"
-  , "/*x*/011"
   , "/*f*/\"hello\\nworld\""
   , "/*g*/'hello\\nworld'"
   , "/*h*/this"
@@ -135,6 +132,21 @@ def programCases : List String :=
   -- module
   ]
 
+/-- Sources whose printed form is *not* the input: a numeric literal is kept
+as the number it denotes and printed canonically, so its spelling is
+normalised the way `prettier` normalises it.  Everything else — the layout,
+the comments — still comes back unchanged. -/
+def normalisedCases : List (String × String) :=
+  [ ("/*d*/0x1234fF", "/*d*/0x1234ff")
+  , ("/*e*/1.0e4", "/*e*/10000")
+  , ("/*x*/011", "/*x*/0o11")
+  -- the printer puts what follows a literal back at the column it was
+  -- written at, so a literal which prints shorter than it was written
+  -- leaves the space it used to take
+  , ("x=1.50", "x=1.5 ")
+  , ("x=/*a*/0X1F/*b*/", "x=/*a*/0x1f/*b*/")
+  ]
+
 def moduleCases : List String :=
   [ "import  def  from 'mod'"
   , "import  def  from   \"mod\";"
@@ -158,6 +170,9 @@ def spec : Spec := do
     for str in programCases do
       it (escapeLabel str) do
         shouldEqual (renderToString (readJs str)) str
+    for (str, expected) in normalisedCases do
+      it (escapeLabel str) do
+        shouldEqual (renderToString (readJs str)) expected
     for str in moduleCases do
       it (escapeLabel str) do
         shouldEqual (renderToString (readJsModule str)) str

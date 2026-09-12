@@ -76,8 +76,8 @@ def printCases : List (String × String × String) :=
   , ("x=(a+b)*c;y=a+(b*c);z=-(-1);", miniPrint "x=(a+b)*c;y=a+(b*c);z=-(-1);", "x = (a + b) * c;\ny = a + b * c;\nz = -(-1);\n")
   , ("let g=x=>({y:1});(function(){})();", miniPrint "let g=x=>({y:1});(function(){})();", "let g = (x) => ({ y: 1 });\n(function () {})();\n")
     -- literals are normalised
-  , ("literals", miniPrint "let s=`a${b}c`;let r=/ab+/gi;let n=0XFF;let m=1.50;let q=.5e+07;", "let s = `a${b}c`;\nlet r = /ab+/gi;\nlet n = 0xff;\nlet m = 1.5;\nlet q = 0.5e7;\n")
-  , ("quotes", miniPrint "x = 'it\'s';y=\"say \"hi\"\";z='\\u0041\\n';", "x = \"it's\";\ny = 'say \"hi\"';\nz = \"A\\n\";\n")
+  , ("literals", miniPrint "let s=`a${b}c`;let r=/ab+/gi;let n=0XFF;let m=1.50;let q=.5e+07;", "let s = `a${b}c`;\nlet r = /ab+/gi;\nlet n = 0xff;\nlet m = 1.5;\nlet q = 5000000;\n")
+  , ("quotes", miniPrint "x = 'it\\'s';y=\"say \\\"hi\\\"\";z='\\u0041\\n';", "x = \"it's\";\ny = 'say \"hi\"';\nz = \"A\\n\";\n")
   , ("export {a as b} from 'm';export const x=1;", miniPrint "export {a as b} from 'm';export const x=1;", "export { a as b } from \"m\";\nexport const x = 1;\n")
   , ("f(...args);function g(a,...rest){}", miniPrint "f(...args);function g(a,...rest){}", "f(...args);\nfunction g(a, ...rest) {}\n")
   , ("a.b.c(1)[2].d;new Foo;new a.b(1);", miniPrint "a.b.c(1)[2].d;new Foo;new a.b(1);", "a.b.c(1)[2].d;\nnew Foo();\nnew a.b(1);\n")
@@ -142,15 +142,30 @@ def roundTripSources : List String :=
 
 /-! ## Literals -/
 
+/-- The canonical spelling of the numeric literal written `raw`. -/
+def num (raw : String) : String := (Language.JavaScript.JSNumber.parse! raw).render
+
+/-- The canonical spelling of the regular expression literal `raw`. -/
+def re (raw : String) : String := (Language.JavaScript.RegExpLit.parse! raw).render
+
 def literalCases : List (String × String × String) :=
-  [ ("normalizeNumber 1.50", normalizeNumber "1.50", "1.5")
-  , ("normalizeNumber 1.00", normalizeNumber "1.00", "1.0")
-  , ("normalizeNumber .5", normalizeNumber ".5", "0.5")
-  , ("normalizeNumber 1.", normalizeNumber "1.", "1")
-  , ("normalizeNumber 1E+07", normalizeNumber "1E+07", "1e7")
-  , ("normalizeNumber 1e-07", normalizeNumber "1e-07", "1e-7")
-  , ("normalizeNumber 1e0", normalizeNumber "1e0", "1")
-  , ("normalizeNumber 0XFF", normalizeNumber "0XFF", "0xff")
+  [ ("number 1.50", num "1.50", "1.5")
+  , ("number 1.00", num "1.00", "1")
+  , ("number .5", num ".5", "0.5")
+  , ("number 1.", num "1.", "1")
+  , ("number 1E+07", num "1E+07", "10000000")
+  , ("number 1e-07", num "1e-07", "1e-7")
+  , ("number 1e0", num "1e0", "1")
+  , ("number 0XFF", num "0XFF", "0xff")
+  , ("number 0b1010", num "0b1010", "0b1010")
+  , ("number legacy octal 017", num "017", "0o17")
+  , ("number 1_000", num "1_000", "1000")
+  , ("number 123n", num "123n", "123n")
+  , ("number 1e21", num "1e21", "1e21")
+  , ("number 9007199254740991", num "9007199254740991", "9007199254740991")
+  , ("regex /ab+/gi", re "/ab+/gi", "/ab+/gi")
+  , ("regex flags are canonically ordered", re "/a/yig", "/a/giy")
+  , ("regex a slash in a class is not the end", re "/[/]a/", "/[/]a/")
   , ("decode 'a\\nb'", decodeStringLiteral "'a\\nb'", "a\nb")
   , ("decode '\\u0041'", decodeStringLiteral "'\\u0041'", "A")
   , ("decode '\\x41'", decodeStringLiteral "'\\x41'", "A")
@@ -160,6 +175,28 @@ def literalCases : List (String × String × String) :=
   , ("encode with double quotes", encodeStringLiteral "say \"hi\"", "'say \"hi\"'")
   , ("encode with single quotes", encodeStringLiteral "it's", "\"it's\"")
   , ("encode both quotes", encodeStringLiteral "'\"", "\"\'\\\"\"")
+  -- a literal is decoded in place, so the escapes which run past the end of
+  -- the text, and the ones which denote no character, are worth a test each
+  , ("decode a backslash at the end", decodeStringLiteral "'a\\'", "a")
+  , ("decode a hexadecimal escape of too few digits",
+      decodeStringLiteral "'\\x4'", "x4")
+  , ("decode a unicode escape of too few digits",
+      decodeStringLiteral "'\\u041'", "u041")
+  , ("decode an unterminated brace escape", decodeStringLiteral "'\\u{41'", "u{41")
+  , ("decode a brace escape of no digits", decodeStringLiteral "'\\u{}'", "u{}")
+  , ("decode a brace escape out of range keeps its text",
+      decodeStringLiteral "'\\u{110000}'", "\\u{110000}")
+  , ("decode a high surrogate with no low one keeps its text",
+      decodeStringLiteral "'\\ud83d'", "\\ud83d")
+  , ("decode a line continuation", decodeStringLiteral "'a\\\nb'", "ab")
+  , ("decode the null escape", decodeStringLiteral "'\\0'", "\x00")
+  , ("decode a zero followed by a digit", decodeStringLiteral "'\\01'", "01")
+  , ("decode a literal with no quotes at all", decodeStringLiteral "a\\nb", "a\nb")
+  , ("decode a literal with characters which take several bytes",
+      decodeStringLiteral "'é\\n∀'", "é\n∀")
+  , ("encode a character which takes several bytes",
+      encodeStringLiteral "é∀", "\"é∀\"")
+  , ("encode a control character", encodeStringLiteral "\x01", "\"\\x01\"")
   ]
 
 /-! ## The `[js| ... |end_js]` syntax

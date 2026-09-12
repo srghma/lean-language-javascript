@@ -18,8 +18,8 @@ import LanguageJavascript.Parser
 
 namespace Language.JavaScript.MiniAST
 
-open LanguageJavaScript.Parser
-open LanguageJavaScript.Parser.AST
+open Language.JavaScript.Parser
+open Language.JavaScript.Parser.AST
 
 /-- Result of a conversion: either the node or a message. -/
 abbrev ConvM := Except String
@@ -39,16 +39,17 @@ private def nonemptyList (what : String) (l : List α) : ConvM (NEList α) :=
   | none => .error ("MiniAST: empty " ++ what)
 
 private def identName? : JSIdent → Option NEString
-  | .JSIdentName _ s => NEString.ofString? s
+  | .JSIdentName _ s => some s
   | .JSIdentNone => none
 
 private def identName (what : String) : JSIdent → ConvM NEString
-  | .JSIdentName _ s => nonempty what s
+  | .JSIdentName _ s => pure s
   | .JSIdentNone => unsupported ("anonymous " ++ what)
 
-private def binOp : JSBinOp → ConvM MiniBinOp
+private def binOp : JSBinOp → ConvM BinOp
   | .JSBinOpAnd _ => pure .and
   | .JSBinOpOr _ => pure .or
+  | .JSBinOpNullish _ => pure .coalesce
   | .JSBinOpBitAnd _ => pure .bitAnd
   | .JSBinOpBitOr _ => pure .bitOr
   | .JSBinOpBitXor _ => pure .bitXor
@@ -72,7 +73,7 @@ private def binOp : JSBinOp → ConvM MiniBinOp
   | .JSBinOpInstanceOf _ => pure .instanceOf
   | .JSBinOpOf _ => unsupported "'of' outside a for statement"
 
-private def unaryOp : JSUnaryOp → ConvM MiniUnaryOp
+private def unaryOp : JSUnaryOp → ConvM UnaryOp
   | .JSUnaryOpNot _ => pure .not
   | .JSUnaryOpTilde _ => pure .tilde
   | .JSUnaryOpPlus _ => pure .plus
@@ -83,12 +84,12 @@ private def unaryOp : JSUnaryOp → ConvM MiniUnaryOp
   | .JSUnaryOpIncr _ => pure .preIncr
   | .JSUnaryOpDecr _ => pure .preDecr
 
-private def postfixOp : JSUnaryOp → ConvM MiniPostfixOp
+private def postfixOp : JSUnaryOp → ConvM PostfixOp
   | .JSUnaryOpIncr _ => pure .incr
   | .JSUnaryOpDecr _ => pure .decr
   | _ => unsupported "postfix operator"
 
-private def assignOp : JSAssignOp → ConvM MiniAssignOp
+private def assignOp : JSAssignOp → ConvM AssignOp
   | .JSAssign _ => pure .assign
   | .JSPlusAssign _ => pure .plus
   | .JSMinusAssign _ => pure .minus
@@ -101,67 +102,176 @@ private def assignOp : JSAssignOp → ConvM MiniAssignOp
   | .JSBwAndAssign _ => pure .bitAnd
   | .JSBwXorAssign _ => pure .bitXor
   | .JSBwOrAssign _ => pure .bitOr
+  | .JSLogicalAndAssign _ => pure .logicalAnd
+  | .JSLogicalOrAssign _ => pure .logicalOr
+  | .JSNullishAssign _ => pure .coalesce
 
 private def fromCommaTrailingList {a : Type} : JSCommaTrailingList a → List a
   | .JSCTLComma xs _ => fromCommaList xs
   | .JSCTLNone xs => fromCommaList xs
 
-/-- Drop the delimiters of the head of a template literal: `` `text${ `` or
-`` `text` ``. -/
-private def templateHeadText (s : String) : String :=
-  let cs := s.toList
-  let cs := match cs with | '`' :: r => r | r => r
-  let cs :=
-    if cs.length ≥ 2 && (cs.drop (cs.length - 2)) == ['$', '{'] then cs.take (cs.length - 2)
-    else match cs.reverse with | '`' :: r => r.reverse | _ => cs
-  String.ofList cs
+/-! The conversion is *structurally* recursive: every function below
+recurses on a component of its argument, so the block has equations and can
+be reasoned about, rather than being `partial` and opaque.
 
-/-- Drop the delimiters of the text following a substitution: `}text${` or
-`` }text` ``. -/
-private def templatePartText (s : String) : String :=
-  let cs := s.toList
-  let cs := match cs with | '}' :: r => r | r => r
-  let cs :=
-    if cs.length ≥ 2 && (cs.drop (cs.length - 2)) == ['$', '{'] then cs.take (cs.length - 2)
-    else match cs.reverse with | '`' :: r => r.reverse | _ => cs
-  String.ofList cs
+Three things had to be arranged for that.  A comma list is walked as the
+inductive value it is instead of being flattened first, since the flattened
+list is not a component of the node; the flattened forms (`ofExprsRev` and
+friends) return their elements in *reverse* order — one `List.reverse` at
+the end is cheaper than an append per element, and reversing keeps the
+conversions in source order, so it is still the leftmost failure that is
+reported.  Every `mapM` of a conversion is spelled out as a function of the
+same block.  And the wrappers which convert something without descending
+into it (`ofArrowBody`, `ofParams`, `ofExpressionList`, …) are defined
+after the block in terms of the functions in it. -/
+
+/-- The elements of a list of expressions, combined with the comma
+operator; `none` if there are none. -/
+private def seqOf : List MiniExpr → Option MiniExpr
+  | [] => none
+  | e :: es => some (es.foldl (fun a b => .seq a b) e)
+
+/-- A class member, from its already converted method definition. -/
+private def classElemOf (decorators : List MiniExpr) (isStatic : Bool)
+    (m : MethodKind × MiniPropertyName × List MiniParam × List MiniStatement) :
+    MiniClassElement :=
+  .method decorators isStatic m.1 m.2.1 m.2.2.1 m.2.2.2
+
+/-- Is this expression the *syntax* of an optional chain — does it contain a
+`?.` which a further `.name`, `[i]` or `(args)` written after it would
+short circuit?  A pair of parentheses closes the chain, and so stops this. -/
+private def isChainSyntax : JSExpression → Bool
+  | .JSOptionalMemberDot .. | .JSOptionalMemberSquare .. | .JSOptionalCallExpression .. => true
+  | .JSMemberDot e _ _ | .JSMemberSquare e _ _ _ | .JSCallExpression e _ _ _
+  | .JSCallExpressionDot e _ _ | .JSCallExpressionSquare e _ _ _
+  | .JSMemberExpression e _ _ _ => isChainSyntax e
+  | _ => false
+
+/-- Add a link to the end of an optional chain, starting one if the base is
+not a chain already. -/
+private def chainWith (base : MiniExpr) (link : MiniChainLink) : MiniExpr :=
+  match base with
+  | .chain b links => .chain b ⟨links.hd, links.tl ++ [link]⟩
+  | _ => .chain base ⟨link, []⟩
+
+/-- Is this a rest element, `...r`, of a parameter list or of an array
+pattern? -/
+private def isRestElem : JSExpression → Bool
+  | .JSSpreadExpression .. => true
+  | _ => false
+
+/-- Is this the left hand side of a *destructuring* assignment, an array or
+object pattern rather than an ordinary target? -/
+private def isPatternLhs : JSExpression → Bool
+  | .JSArrayLiteral .. | .JSObjectLiteral .. => true
+  | _ => false
+
+/-- Is this the plain `=`, the only assignment operator a destructuring
+assignment may use? -/
+private def isSimpleAssign : JSAssignOp → Bool
+  | .JSAssign _ => true
+  | _ => false
+
+/-- The name written after a `.` or a `?.`, and whether it is private. -/
+private def dotName : JSExpression → ConvM (Bool × NEString)
+  | .JSIdentifier _ n => pure (false, n)
+  | .JSLiteral _ k => pure (false, k.text)
+  | .JSPrivateName _ n => pure (true, n)
+  | _ => unsupported "member name"
+
+/-- `super.name`; a private name may not follow `super`. -/
+private def superDotOf : Bool × NEString → ConvM MiniExpr
+  | (true, _) => unsupported "a private name after `super`"
+  | (false, n) => pure (.superDot n)
+
+/-- The member access `obj.name`, extending the chain `obj` is part of, if
+it is part of one. -/
+private def dotOf (inChain : Bool) (obj : MiniExpr) (priv : Bool) (name : NEString) : MiniExpr :=
+  if inChain then chainWith obj (if priv then .privateDot false name else .dot false name)
+  else if priv then .privateDot obj name else .dot obj name
+
+/-- The index access `obj[idx]`, extending the chain `obj` is part of. -/
+private def indexOf (inChain : Bool) (obj idx : MiniExpr) : MiniExpr :=
+  if inChain then chainWith obj (.index false idx) else .index obj idx
+
+/-- The call `callee(args)`, extending the chain `callee` is part of. -/
+private def callOf (inChain : Bool) (callee : MiniExpr) (args : List MiniExpr) : MiniExpr :=
+  if inChain then chainWith callee (.call false args) else .call callee args
 
 mutual
 
 /-- Convert an expression, dropping parentheses. -/
-partial def ofExpression : JSExpression → ConvM MiniExpr
-  | .JSIdentifier _ n => do pure (.ident (← nonempty "identifier" n))
-  | .JSDecimal _ s => do pure (.number (← nonempty "number" (normalizeNumber s)))
-  | .JSHexInteger _ s => do pure (.number (← nonempty "number" (normalizeNumber s)))
-  | .JSOctal _ s => do pure (.number (← nonempty "number" (normalizeNumber s)))
-  | .JSStringLiteral _ s => pure (.string (decodeStringLiteral s))
-  | .JSRegEx _ s => do pure (.regex (← nonempty "regular expression" s))
-  | .JSLiteral _ s =>
-      match s with
-      | "null" => pure .null
-      | "true" => pure .true_
-      | "false" => pure .false_
-      | "this" => pure .this
-      | _ => do pure (.ident (← nonempty "identifier" s))
+def ofExpression : JSExpression → ConvM MiniExpr
+  | .JSIdentifier _ n => pure (.ident n)
+  | .JSNumberLit _ s => pure (.number s)
+  | .JSStringLiteral _ s => pure (.string (decodeStringLiteral s.render))
+  | .JSRegEx _ s => pure (.regex s)
+  | .JSLiteral _ k =>
+      match k with
+      | .null => pure .null
+      | .true_ => pure .true_
+      | .false_ => pure .false_
+      | .this_ => pure .this
+      -- `super` is only an expression as `super.x`, `super[i]` or
+      -- `super(...)`, which the cases below read
+      | .super => unsupported "`super` outside a member access or a call"
+      | .debugger => pure (.ident k.text)
   | .JSArrayLiteral _ els _ => do
       let els ← ofArrayElements true els
       pure (.array els)
   | .JSObjectLiteral _ props _ => do
-      let ps ← (fromCommaTrailingList props).mapM ofObjectProperty
-      pure (.object ps)
+      pure (.object (← ofPropsTrailingRev props).reverse)
   | .JSAssignExpression l op r => do
-      pure (.assign (← ofExpression l) (← assignOp op) (← ofExpression r))
+      -- `[a, b] = xs` and `({ a } = o)` assign to a *pattern*
+      if isPatternLhs l && isSimpleAssign op then
+        pure (.assignPattern (← ofPattern l) (← ofExpression r))
+      else pure (.assign (← ofExpression l) (← assignOp op) (← ofExpression r))
   | .JSAwaitExpression _ e => do pure (.await (← ofExpression e))
+  -- the three forms `super` may be written in
+  | .JSCallExpression (.JSLiteral _ .super) _ args _ => do
+      pure (.superCall (← ofExprsRev args).reverse)
+  | .JSMemberExpression (.JSLiteral _ .super) _ args _ => do
+      pure (.superCall (← ofExprsRev args).reverse)
+  | .JSCallExpressionDot (.JSLiteral _ .super) _ p => do
+      pure (← superDotOf (← dotName p))
+  | .JSMemberDot (.JSLiteral _ .super) _ p => do
+      pure (← superDotOf (← dotName p))
+  | .JSCallExpressionSquare (.JSLiteral _ .super) _ i _ => do
+      pure (.superIndex (← ofExpression i))
+  | .JSMemberSquare (.JSLiteral _ .super) _ i _ => do
+      pure (.superIndex (← ofExpression i))
   | .JSCallExpression e _ args _ => do
-      pure (.call (← ofExpression e) (← (fromCommaList args).mapM ofExpression))
+      pure (callOf (isChainSyntax e) (← ofExpression e) (← ofExprsRev args).reverse)
   | .JSMemberExpression e _ args _ => do
-      pure (.call (← ofExpression e) (← (fromCommaList args).mapM ofExpression))
-  | .JSCallExpressionDot e _ p => do pure (.dot (← ofExpression e) (← ofMemberName p))
-  | .JSMemberDot e _ p => do pure (.dot (← ofExpression e) (← ofMemberName p))
-  | .JSCallExpressionSquare e _ i _ => do pure (.index (← ofExpression e) (← ofExpression i))
-  | .JSMemberSquare e _ i _ => do pure (.index (← ofExpression e) (← ofExpression i))
-  | .JSClassExpression _ n h _ body _ => do
-      pure (.classExpr (identName? n) (← ofHeritage h) (← ofClassElements body))
+      pure (callOf (isChainSyntax e) (← ofExpression e) (← ofExprsRev args).reverse)
+  | .JSCallExpressionDot e _ p => do
+      let (priv, n) ← dotName p
+      pure (dotOf (isChainSyntax e) (← ofExpression e) priv n)
+  | .JSMemberDot e _ p => do
+      let (priv, n) ← dotName p
+      pure (dotOf (isChainSyntax e) (← ofExpression e) priv n)
+  | .JSCallExpressionSquare e _ i _ => do
+      pure (indexOf (isChainSyntax e) (← ofExpression e) (← ofExpression i))
+  | .JSMemberSquare e _ i _ => do
+      pure (indexOf (isChainSyntax e) (← ofExpression e) (← ofExpression i))
+  | .JSOptionalMemberDot e _ p => do
+      let (priv, n) ← dotName p
+      pure (chainWith (← ofExpression e) (if priv then .privateDot true n else .dot true n))
+  | .JSOptionalMemberSquare e _ _ i _ => do
+      pure (chainWith (← ofExpression e) (.index true (← ofExpression i)))
+  | .JSOptionalCallExpression e _ _ args _ => do
+      pure (chainWith (← ofExpression e) (.call true (← ofExprsRev args).reverse))
+  | .JSPrivateName _ n => pure (.privateName n)
+  | .JSImportMeta _ _ _ => pure .importMeta
+  | .JSNewTarget _ _ _ => pure .newTarget
+  | .JSImportCall _ _ args _ => do
+      match (← ofExprsRev args).reverse with
+      | [spec] => pure (.importCall spec none)
+      | [spec, opts] => pure (.importCall spec (some opts))
+      | _ => unsupported "a dynamic import with no specifier or too many arguments"
+  | .JSClassExpression ds _ n h _ body _ => do
+      pure (.classExpr (← ofDecorators ds) (identName? n) (← ofHeritage h)
+        (← ofClassElements body))
   | .JSCommaExpression l _ r => do pure (.seq (← ofExpression l) (← ofExpression r))
   | .JSExpressionBinary l op r => do
       pure (.binary (← ofExpression l) (← binOp op) (← ofExpression r))
@@ -170,22 +280,26 @@ partial def ofExpression : JSExpression → ConvM MiniExpr
   | .JSExpressionTernary c _ t _ f => do
       pure (.ternary (← ofExpression c) (← ofExpression t) (← ofExpression f))
   | .JSArrowExpression params _ body => do
-      pure (.arrow (← ofArrowParams params) (← ofArrowBody body))
+      let ps ← ofArrowParams params
+      match body with
+      | .JSStatementBlock _ stmts _ _ => pure (.arrow ps (.block (← ofStatements stmts)))
+      | .JSExpressionStatement e _ => pure (.arrow ps (.expr (← ofExpression e)))
+      | s => pure (.arrow ps (.block [← ofStatement s]))
   | .JSFunctionExpression _ n _ params _ body => do
-      pure (.func false false (identName? n) (← (fromCommaList params).mapM ofExpression)
+      pure (.func false false (identName? n) (← ofParamsRev params).reverse
         (← ofBlockBody body))
   | .JSGeneratorExpression _ _ n _ params _ body => do
-      pure (.func false true (identName? n) (← (fromCommaList params).mapM ofExpression)
+      pure (.func false true (identName? n) (← ofParamsRev params).reverse
         (← ofBlockBody body))
   | .JSMemberNew _ e _ args _ => do
-      pure (.new (← ofExpression e) (← (fromCommaList args).mapM ofExpression))
+      pure (.new (← ofExpression e) (← ofExprsRev args).reverse)
   | .JSNewExpression _ e => do pure (.new (← ofExpression e) [])
   | .JSSpreadExpression _ e => do pure (.spread (← ofExpression e))
   | .JSTemplateLiteral tag _ head parts => do
       let tag ← match tag with
         | none => pure none
         | some t => pure (some (← ofExpression t))
-      pure (.template tag (templateHeadText head) (← parts.mapM ofTemplatePart))
+      pure (.template tag head (← ofTemplateParts parts))
   | .JSUnaryExpression op e => do pure (.unary (← unaryOp op) (← ofExpression e))
   | .JSVarInitExpression lhs init => do
       match init with
@@ -196,16 +310,108 @@ partial def ofExpression : JSExpression → ConvM MiniExpr
       | none => pure (.yield none)
       | some e => pure (.yield (some (← ofExpression e)))
   | .JSYieldFromExpression _ _ e => do pure (.yieldFrom (← ofExpression e))
+termination_by structural e => e
 
-/-- The name after a `.`. -/
-partial def ofMemberName : JSExpression → ConvM NEString
-  | .JSIdentifier _ n => nonempty "member name" n
-  | .JSLiteral _ n => nonempty "member name" n
-  | _ => unsupported "member name"
+/-- The expressions of a comma list, in reverse order. -/
+def ofExprsRev : JSCommaList JSExpression → ConvM (List MiniExpr)
+  | .JSLNil => pure []
+  | .JSLOne e => do pure [← ofExpression e]
+  | .JSLCons l _ e => do
+      let init ← ofExprsRev l
+      let last ← ofExpression e
+      pure (last :: init)
+
+/-- The decorators of a class or of one of its members. -/
+def ofDecorators : List JSDecorator → ConvM (List MiniExpr)
+  | [] => pure []
+  | .JSDecorator _ e :: rest => do pure ((← ofExpression e) :: (← ofDecorators rest))
+
+/-- The pattern an expression of the annotated tree spells: a name, an
+array or object pattern, a default value, or — outside a declaration — an
+assignment target such as `o.p`. -/
+def ofPattern : JSExpression → ConvM MiniPattern
+  | .JSIdentifier _ n => pure (.ident n)
+  | .JSExpressionParen _ e _ => ofPattern e
+  | .JSArrayLiteral _ els _ => do pure (.array (← ofArrayPatternElems true els))
+  | .JSObjectLiteral _ props _ => do
+      let (ps, rest) ← ofObjectPatternRev props
+      pure (.object ps.reverse rest)
+  | .JSAssignExpression lhs (.JSAssign _) rhs => do
+      pure (.withDefault (← ofPattern lhs) (← ofExpression rhs))
+  | .JSVarInitExpression lhs (.JSVarInit _ e) => do
+      pure (.withDefault (← ofPattern lhs) (← ofExpression e))
+  | .JSVarInitExpression lhs .JSVarInitNone => ofPattern lhs
+  -- the pattern of a rest element, `...r`; which of the two it is, the
+  -- caller decides
+  | .JSSpreadExpression _ e => ofPattern e
+  | .JSMemberDot e _ p => do
+      let (priv, n) ← dotName p
+      pure (.target (dotOf (isChainSyntax e) (← ofExpression e) priv n))
+  | .JSMemberSquare e _ i _ => do
+      pure (.target (indexOf (isChainSyntax e) (← ofExpression e) (← ofExpression i)))
+  | .JSCallExpressionDot e _ p => do
+      let (priv, n) ← dotName p
+      pure (.target (dotOf (isChainSyntax e) (← ofExpression e) priv n))
+  | .JSCallExpressionSquare e _ i _ => do
+      pure (.target (indexOf (isChainSyntax e) (← ofExpression e) (← ofExpression i)))
+  | _ => unsupported "binding pattern"
+
+/-- One element of an array pattern; `...r` binds the rest of the array. -/
+def ofArrayPatternElem : JSArrayElement → ConvM MiniArrayPatternElem
+  | .JSArrayElement e => do
+      let p ← ofPattern e
+      pure (if isRestElem e then .rest p else .elem p)
+  | .JSArrayComma _ => pure .hole
+
+/-- The elements of an array pattern; as in an array literal, the commas
+are interleaved, so an elision is a comma where an element was expected. -/
+def ofArrayPatternElems (expectElem : Bool) :
+    List JSArrayElement → ConvM (List MiniArrayPatternElem)
+  | [] => pure []
+  | .JSArrayComma _ :: rest =>
+      if expectElem then do pure (.hole :: (← ofArrayPatternElems true rest))
+      else ofArrayPatternElems true rest
+  | e :: rest => do
+      pure ((← ofArrayPatternElem e) :: (← ofArrayPatternElems false rest))
+
+/-- One property of an object pattern: a key/value pair, or the `...rest`. -/
+def ofObjectPatternEntry :
+    JSObjectProperty → ConvM (MiniObjectPatternProp ⊕ MiniPattern)
+  | .JSObjectSpread _ e => do pure (.inr (← ofPattern e))
+  | .JSPropertyIdentRef _ n => pure (.inl ⟨.ident n, .ident n⟩)
+  | .JSPropertyIdentRefDefault _ n _ v => do
+      pure (.inl ⟨.ident n, .withDefault (.ident n) (← ofExpression v)⟩)
+  | .JSPropertyNameandValue key _ value => do
+      pure (.inl ⟨← ofPropertyName key, ← ofPattern value⟩)
+  | _ => unsupported "property of an object pattern"
+
+/-- The properties of an object pattern, in reverse order, together with
+its `...rest`, which JavaScript only allows as the last property. -/
+def ofObjectPatternRev :
+    JSCommaTrailingList JSObjectProperty →
+      ConvM (List MiniObjectPatternProp × Option MiniPattern)
+  | .JSCTLComma ps _ => ofObjectPatternPropsRev ps
+  | .JSCTLNone ps => ofObjectPatternPropsRev ps
+
+def ofObjectPatternPropsRev :
+    JSCommaList JSObjectProperty → ConvM (List MiniObjectPatternProp × Option MiniPattern)
+  | .JSLNil => pure ([], none)
+  | .JSLOne p => do
+      match ← ofObjectPatternEntry p with
+      | .inl prop => pure ([prop], none)
+      | .inr r => pure ([], some r)
+  | .JSLCons l _ p => do
+      let (init, rest) ← ofObjectPatternPropsRev l
+      if rest.isSome then unsupported "a rest property which is not the last one"
+      else
+        match ← ofObjectPatternEntry p with
+        | .inl prop => pure (prop :: init, none)
+        | .inr r => pure (init, some r)
+
 
 /-- Array literal elements; the annotated AST interleaves the commas, so an
 elision is a comma where an element was expected. -/
-partial def ofArrayElements (expectElem : Bool) :
+def ofArrayElements (expectElem : Bool) :
     List JSArrayElement → ConvM (List MiniArrayElement)
   | [] => pure []
   | .JSArrayElement e :: rest => do
@@ -215,164 +421,224 @@ partial def ofArrayElements (expectElem : Bool) :
       if expectElem then do pure (.hole :: (← ofArrayElements true rest))
       else ofArrayElements true rest
 
-partial def ofTemplatePart : JSTemplatePart → ConvM MiniTemplatePart
-  | .JSTemplatePart e _ suffix => do pure ⟨← ofExpression e, templatePartText suffix⟩
+def ofTemplatePart : JSTemplatePart → ConvM MiniTemplatePart
+  | .JSTemplatePart e _ suffix => do pure ⟨← ofExpression e, suffix⟩
 
-partial def ofPropertyName : JSPropertyName → ConvM MiniPropertyName
-  | .JSPropertyIdent _ n => do pure (.ident (← nonempty "property name" n))
-  | .JSPropertyString _ s => pure (.string (decodeStringLiteral s))
-  | .JSPropertyNumber _ n => do pure (.number (← nonempty "property name" (normalizeNumber n)))
+def ofTemplateParts : List JSTemplatePart → ConvM (List MiniTemplatePart)
+  | [] => pure []
+  | p :: rest => do pure ((← ofTemplatePart p) :: (← ofTemplateParts rest))
+
+def ofPropertyName : JSPropertyName → ConvM MiniPropertyName
+  | .JSPropertyIdent _ n => pure (.ident n)
+  | .JSPropertyPrivate _ n => pure (.private_ n)
+  | .JSPropertyString _ s => pure (.string (decodeStringLiteral s.render))
+  | .JSPropertyNumber _ n => pure (.number n)
   | .JSPropertyComputed _ e _ => do pure (.computed (← ofExpression e))
 
-partial def ofObjectProperty : JSObjectProperty → ConvM MiniProperty
-  | .JSPropertyIdentRef _ n => do pure (.shorthand (← nonempty "property name" n))
-  | .JSPropertyNameandValue name _ values => do
-      match values with
-      | [v] => pure (.keyValue (← ofPropertyName name) (← ofExpression v))
-      | _ => unsupported "property value"
+def ofObjectProperty : JSObjectProperty → ConvM MiniProperty
+  | .JSPropertyIdentRef _ n => pure (.shorthand n)
+  | .JSPropertyIdentRefDefault .. =>
+      unsupported "a default value in an object literal which is not a pattern"
+  | .JSObjectSpread _ e => do pure (.spread (← ofExpression e))
+  | .JSPropertyNameandValue name _ value => do
+      pure (.keyValue (← ofPropertyName name) (← ofExpression value))
   | .JSObjectMethod m => do
       let (kind, name, params, body) ← ofMethodDefinition m
       pure (.method kind name params body)
 
-partial def ofMethodDefinition :
+/-- The properties of an object literal, in reverse order. -/
+def ofPropsRev : JSCommaList JSObjectProperty → ConvM (List MiniProperty)
+  | .JSLNil => pure []
+  | .JSLOne p => do pure [← ofObjectProperty p]
+  | .JSLCons l _ p => do
+      let init ← ofPropsRev l
+      let last ← ofObjectProperty p
+      pure (last :: init)
+
+/-- The properties of an object literal (which may end with a comma), in
+reverse order. -/
+def ofPropsTrailingRev : JSCommaTrailingList JSObjectProperty → ConvM (List MiniProperty)
+  | .JSCTLComma ps _ => ofPropsRev ps
+  | .JSCTLNone ps => ofPropsRev ps
+
+def ofMethodDefinition :
     JSMethodDefinition →
-      ConvM (MiniMethodKind × MiniPropertyName × List MiniExpr × List MiniStatement)
+      ConvM (MethodKind × MiniPropertyName × List MiniParam × List MiniStatement)
   | .JSMethodDefinition name _ params _ body => do
-      pure (.normal, ← ofPropertyName name, ← (fromCommaList params).mapM ofExpression,
-        ← ofBlockBody body)
+      pure (.normal, ← ofPropertyName name, (← ofParamsRev params).reverse, ← ofBlockBody body)
   | .JSGeneratorMethodDefinition _ name _ params _ body => do
-      pure (.generator, ← ofPropertyName name, ← (fromCommaList params).mapM ofExpression,
+      pure (.generator, ← ofPropertyName name, (← ofParamsRev params).reverse,
         ← ofBlockBody body)
   | .JSPropertyAccessor acc name _ params _ body => do
       let kind := match acc with
-        | .JSAccessorGet _ => MiniMethodKind.get
-        | .JSAccessorSet _ => MiniMethodKind.set
-      pure (kind, ← ofPropertyName name, ← (fromCommaList params).mapM ofExpression,
-        ← ofBlockBody body)
+        | .JSAccessorGet _ => MethodKind.get
+        | .JSAccessorSet _ => MethodKind.set
+      pure (kind, ← ofPropertyName name, (← ofParamsRev params).reverse, ← ofBlockBody body)
 
-partial def ofClassElements (els : List JSClassElement) : ConvM (List MiniClassElement) := do
-  let mut out := #[]
-  for el in els do
-    match el with
-    | .JSClassSemi _ => pure ()
-    | .JSClassInstanceMethod m =>
-        let (kind, name, params, body) ← ofMethodDefinition m
-        out := out.push ⟨false, kind, name, params, body⟩
-    | .JSClassStaticMethod _ m =>
-        let (kind, name, params, body) ← ofMethodDefinition m
-        out := out.push ⟨true, kind, name, params, body⟩
-  pure out.toList
+/-- The members of a class body; an empty member (a stray `;`) is
+dropped. -/
+def ofClassElements : List JSClassElement → ConvM (List MiniClassElement)
+  | [] => pure []
+  | .JSClassSemi _ :: rest => ofClassElements rest
+  | .JSClassInstanceMethod ds m :: rest => do
+      let ds ← ofDecorators ds
+      let m ← ofMethodDefinition m
+      pure (classElemOf ds false m :: (← ofClassElements rest))
+  | .JSClassStaticMethod ds _ m :: rest => do
+      let ds ← ofDecorators ds
+      let m ← ofMethodDefinition m
+      pure (classElemOf ds true m :: (← ofClassElements rest))
+  | .JSClassInstanceField ds n i _ :: rest => do
+      pure (.field (← ofDecorators ds) false (← ofPropertyName n) (← ofInitializer i)
+        :: (← ofClassElements rest))
+  | .JSClassStaticField ds _ n i _ :: rest => do
+      pure (.field (← ofDecorators ds) true (← ofPropertyName n) (← ofInitializer i)
+        :: (← ofClassElements rest))
+  | .JSClassStaticBlock _ b :: rest => do
+      pure (.staticBlock (← ofBlockBody b) :: (← ofClassElements rest))
 
-partial def ofHeritage : JSClassHeritage → ConvM (Option MiniExpr)
+/-- The `= value` of a class field, if there is one. -/
+def ofInitializer : JSVarInitializer → ConvM (Option MiniExpr)
+  | .JSVarInitNone => pure none
+  | .JSVarInit _ e => do pure (some (← ofExpression e))
+
+def ofHeritage : JSClassHeritage → ConvM (Option MiniExpr)
   | .JSExtendsNone => pure none
   | .JSExtends _ e => do pure (some (← ofExpression e))
 
-partial def ofArrowParams : JSArrowParameterList → ConvM (List MiniExpr)
-  | .JSUnparenthesizedArrowParameter i => do pure [.ident (← identName "arrow parameter" i)]
-  | .JSParenthesizedArrowParameterList _ ps _ => (fromCommaList ps).mapM ofExpression
+/-- The parameters of a function, in reverse order.  A parameter is
+converted by the `match` below rather than by a function of its own,
+because its last case would convert the very node it was given — which is
+not a recursive step. -/
+def ofParamsRev : JSCommaList JSExpression → ConvM (List MiniParam)
+  | .JSLNil => pure []
+  | .JSLOne e => do
+      let p ← ofPattern e
+      pure [if isRestElem e then .rest p else .plain p]
+  | .JSLCons l _ e => do
+      let init ← ofParamsRev l
+      let p ← ofPattern e
+      pure ((if isRestElem e then .rest p else .plain p) :: init)
 
-partial def ofArrowBody : JSStatement → ConvM MiniArrowBody
-  | .JSStatementBlock _ stmts _ _ => do pure (.block (← ofStatements stmts))
-  | .JSExpressionStatement e _ => do pure (.expr (← ofExpression e))
-  | s => do pure (.block [← ofStatement s])
+def ofArrowParams : JSArrowParameterList → ConvM (List MiniParam)
+  | .JSUnparenthesizedArrowParameter i => do
+      pure [.plain (.ident (← identName "arrow parameter" i))]
+  | .JSParenthesizedArrowParameterList _ ps _ => do pure (← ofParamsRev ps).reverse
 
-partial def ofBlockBody : JSBlock → ConvM (List MiniStatement)
+def ofBlockBody : JSBlock → ConvM (List MiniStatement)
   | .JSBlock _ stmts _ => ofStatements stmts
 
 /-- A statement list.  Stray empty statements carry no meaning, so — like
 `prettier` — they are dropped; an empty statement is still kept where it is
 the *body* of a loop or an `if`. -/
-partial def ofStatements (stmts : List JSStatement) : ConvM (List MiniStatement) := do
-  pure ((← stmts.mapM ofStatement).filter fun s => !(s matches .empty))
+def ofStatements : List JSStatement → ConvM (List MiniStatement)
+  | [] => pure []
+  | s :: rest => do
+      let s ← ofStatement s
+      let rest ← ofStatements rest
+      pure (if s matches .empty then rest else s :: rest)
 
-/-- One declarator of a `var`, `let` or `const` statement. -/
-partial def ofDeclarator : JSExpression → ConvM MiniDeclarator
-  | .JSVarInitExpression lhs .JSVarInitNone => do pure ⟨← ofExpression lhs, none⟩
-  | .JSVarInitExpression lhs (.JSVarInit _ e) => do
-      pure ⟨← ofExpression lhs, some (← ofExpression e)⟩
-  | e => do pure ⟨← ofExpression e, none⟩
+/-- The declarators of a `var`, `let` or `const`, in reverse order.  They
+are a non-empty comma list, so the result is a non-empty list and the
+conversion cannot fail for want of a declarator.
 
-partial def ofDeclarators (xs : JSCommaList JSExpression) : ConvM (NEList MiniDeclarator) := do
-  nonemptyList "declaration" (← (fromCommaList xs).mapM ofDeclarator)
+One declarator is converted by the `match` below rather than by a function
+of its own, because its last case would convert the very node it was given
+— which is not a recursive step. -/
+def ofDeclaratorsRev : JSCommaList1 JSExpression → ConvM (NEList MiniDeclarator)
+  | .JSL1One d => do
+      let last : MiniDeclarator ← match d with
+        | .JSVarInitExpression lhs .JSVarInitNone => do pure ⟨← ofPattern lhs, none⟩
+        | .JSVarInitExpression lhs (.JSVarInit _ e) => do
+            pure ⟨← ofPattern lhs, some (← ofExpression e)⟩
+        | e => do pure ⟨← ofPattern e, none⟩
+      pure ⟨last, []⟩
+  | .JSL1Cons l _ d => do
+      let init ← ofDeclaratorsRev l
+      let last : MiniDeclarator ← match d with
+        | .JSVarInitExpression lhs .JSVarInitNone => do pure ⟨← ofPattern lhs, none⟩
+        | .JSVarInitExpression lhs (.JSVarInit _ e) => do
+            pure ⟨← ofPattern lhs, some (← ofExpression e)⟩
+        | e => do pure ⟨← ofPattern e, none⟩
+      pure ⟨last, init.hd :: init.tl⟩
 
-/-- Combine a comma separated list of expressions into a single expression
-with the comma operator. -/
-partial def ofExpressionList (xs : JSCommaList JSExpression) : ConvM (Option MiniExpr) := do
-  match ← (fromCommaList xs).mapM ofExpression with
-  | [] => pure none
-  | e :: es => pure (some (es.foldl (fun a b => .seq a b) e))
-
-partial def ofSwitchPart : JSSwitchParts → ConvM MiniSwitchCase
+def ofSwitchPart : JSSwitchParts → ConvM MiniSwitchCase
   | .JSCase _ e _ stmts => do pure (.case (← ofExpression e) (← ofStatements stmts))
   | .JSDefault _ _ stmts => do pure (.default (← ofStatements stmts))
 
-partial def ofCatch : JSTryCatch → ConvM MiniCatchClause
-  | .JSCatch _ _ p _ body => do pure ⟨← ofExpression p, none, ← ofBlockBody body⟩
-  | .JSCatchIf _ _ p _ cond _ body => do
-      pure ⟨← ofExpression p, some (← ofExpression cond), ← ofBlockBody body⟩
+def ofSwitchParts : List JSSwitchParts → ConvM (List MiniSwitchCase)
+  | [] => pure []
+  | p :: rest => do pure ((← ofSwitchPart p) :: (← ofSwitchParts rest))
 
-partial def ofFinally : JSTryFinally → ConvM MiniFinallyClause
+def ofCatch : JSTryCatch → ConvM MiniCatchClause
+  | .JSCatch _ _ p _ body => do pure ⟨← ofPattern p, none, ← ofBlockBody body⟩
+  | .JSCatchIf _ _ p _ cond _ body => do
+      pure ⟨← ofPattern p, some (← ofExpression cond), ← ofBlockBody body⟩
+
+def ofCatches : List JSTryCatch → ConvM (List MiniCatchClause)
+  | [] => pure []
+  | c :: rest => do pure ((← ofCatch c) :: (← ofCatches rest))
+
+def ofFinally : JSTryFinally → ConvM MiniFinallyClause
   | .JSNoFinally => pure .none
   | .JSFinally _ body => do pure (.some (← ofBlockBody body))
 
-partial def ofTryTail (catches : List JSTryCatch) (fin : JSTryFinally) : ConvM MiniTryTail := do
-  let fin ← ofFinally fin
-  match ← catches.mapM ofCatch with
-  | [] =>
-      match fin with
-      | .some body => pure (.finallyOnly body)
-      | .none => .error "MiniAST: try without catch or finally"
-  | c :: cs => pure (.catches ⟨c, cs⟩ fin)
-
-partial def ofStatement : JSStatement → ConvM MiniStatement
+def ofStatement : JSStatement → ConvM MiniStatement
   | .JSStatementBlock _ stmts _ _ => do pure (.block (← ofStatements stmts))
   | .JSBreak _ i _ => pure (.break_ (identName? i))
   | .JSContinue _ i _ => pure (.continue_ (identName? i))
-  | .JSClass _ n h _ body _ _ => do
-      pure (.classDecl (← identName "class" n) (← ofHeritage h) (← ofClassElements body))
-  | .JSVariable _ decls _ => do pure (.decl .var (← ofDeclarators decls))
-  | .JSLet _ decls _ => do pure (.decl .let_ (← ofDeclarators decls))
-  | .JSConstant _ decls _ => do pure (.decl .const (← ofDeclarators decls))
+  | .JSClass ds _ n h _ body _ _ => do
+      pure (.classDecl (← ofDecorators ds) (← identName "class" n) (← ofHeritage h)
+        (← ofClassElements body))
+  | .JSVariable _ decls _ => do pure (.decl .var (← ofDeclaratorsRev decls).reverse)
+  | .JSLet _ decls _ => do pure (.decl .let_ (← ofDeclaratorsRev decls).reverse)
+  | .JSConstant _ decls _ => do pure (.decl .const (← ofDeclaratorsRev decls).reverse)
+  | .JSUsing _ decls _ => do pure (.using_ false (← ofDeclaratorsRev decls).reverse)
+  | .JSAwaitUsing _ _ decls _ => do pure (.using_ true (← ofDeclaratorsRev decls).reverse)
   | .JSDoWhile _ body _ _ cond _ _ => do
       pure (.doWhile (← ofStatement body) (← ofExpression cond))
   | .JSFor _ _ init _ cond _ step _ body => do
-      let init ← ofExpressionList init
+      let init := seqOf (← ofExprsRev init).reverse
       pure (.for_ (match init with | none => .none | some e => .expr e)
-        (← ofExpressionList cond) (← ofExpressionList step) (← ofStatement body))
+        (seqOf (← ofExprsRev cond).reverse) (seqOf (← ofExprsRev step).reverse)
+        (← ofStatement body))
   | .JSForVar _ _ _ init _ cond _ step _ body => do
-      pure (.for_ (.decl .var (← ofDeclarators init)) (← ofExpressionList cond)
-        (← ofExpressionList step) (← ofStatement body))
+      pure (.for_ (.decl .var (← ofDeclaratorsRev init).reverse)
+        (seqOf (← ofExprsRev cond).reverse) (seqOf (← ofExprsRev step).reverse)
+        (← ofStatement body))
   | .JSForLet _ _ _ init _ cond _ step _ body => do
-      pure (.for_ (.decl .let_ (← ofDeclarators init)) (← ofExpressionList cond)
-        (← ofExpressionList step) (← ofStatement body))
+      pure (.for_ (.decl .let_ (← ofDeclaratorsRev init).reverse)
+        (seqOf (← ofExprsRev cond).reverse) (seqOf (← ofExprsRev step).reverse)
+        (← ofStatement body))
   | .JSForConst _ _ _ init _ cond _ step _ body => do
-      pure (.for_ (.decl .const (← ofDeclarators init)) (← ofExpressionList cond)
-        (← ofExpressionList step) (← ofStatement body))
+      pure (.for_ (.decl .const (← ofDeclaratorsRev init).reverse)
+        (seqOf (← ofExprsRev cond).reverse) (seqOf (← ofExprsRev step).reverse)
+        (← ofStatement body))
   | .JSForIn _ _ lhs _ rhs _ body => do
-      pure (.forIn (.pattern (← ofExpression lhs)) (← ofExpression rhs) (← ofStatement body))
+      pure (.forIn (.pattern (← ofPattern lhs)) (← ofExpression rhs) (← ofStatement body))
   | .JSForVarIn _ _ _ lhs _ rhs _ body => do
-      pure (.forIn (.decl .var (← ofExpression lhs)) (← ofExpression rhs) (← ofStatement body))
+      pure (.forIn (.decl .var (← ofPattern lhs)) (← ofExpression rhs) (← ofStatement body))
   | .JSForLetIn _ _ _ lhs _ rhs _ body => do
-      pure (.forIn (.decl .let_ (← ofExpression lhs)) (← ofExpression rhs) (← ofStatement body))
+      pure (.forIn (.decl .let_ (← ofPattern lhs)) (← ofExpression rhs) (← ofStatement body))
   | .JSForConstIn _ _ _ lhs _ rhs _ body => do
-      pure (.forIn (.decl .const (← ofExpression lhs)) (← ofExpression rhs) (← ofStatement body))
+      pure (.forIn (.decl .const (← ofPattern lhs)) (← ofExpression rhs) (← ofStatement body))
   | .JSForOf _ _ lhs _ rhs _ body => do
-      pure (.forOf (.pattern (← ofExpression lhs)) (← ofExpression rhs) (← ofStatement body))
+      pure (.forOf (.pattern (← ofPattern lhs)) (← ofExpression rhs) (← ofStatement body))
   | .JSForVarOf _ _ _ lhs _ rhs _ body => do
-      pure (.forOf (.decl .var (← ofExpression lhs)) (← ofExpression rhs) (← ofStatement body))
+      pure (.forOf (.decl .var (← ofPattern lhs)) (← ofExpression rhs) (← ofStatement body))
   | .JSForLetOf _ _ _ lhs _ rhs _ body => do
-      pure (.forOf (.decl .let_ (← ofExpression lhs)) (← ofExpression rhs) (← ofStatement body))
+      pure (.forOf (.decl .let_ (← ofPattern lhs)) (← ofExpression rhs) (← ofStatement body))
   | .JSForConstOf _ _ _ lhs _ rhs _ body => do
-      pure (.forOf (.decl .const (← ofExpression lhs)) (← ofExpression rhs) (← ofStatement body))
+      pure (.forOf (.decl .const (← ofPattern lhs)) (← ofExpression rhs) (← ofStatement body))
   | .JSAsyncFunction _ _ n _ params _ body _ => do
       pure (.funcDecl true false (← identName "function" n)
-        (← (fromCommaList params).mapM ofExpression) (← ofBlockBody body))
+        (← ofParamsRev params).reverse (← ofBlockBody body))
   | .JSFunction _ n _ params _ body _ => do
       pure (.funcDecl false false (← identName "function" n)
-        (← (fromCommaList params).mapM ofExpression) (← ofBlockBody body))
+        (← ofParamsRev params).reverse (← ofBlockBody body))
   | .JSGenerator _ _ n _ params _ body _ => do
       pure (.funcDecl false true (← identName "function" n)
-        (← (fromCommaList params).mapM ofExpression) (← ofBlockBody body))
+        (← ofParamsRev params).reverse (← ofBlockBody body))
   | .JSIf _ _ cond _ thenS => do
       pure (.if_ (← ofExpression cond) (← ofStatement thenS) none)
   | .JSIfElse _ _ cond _ thenS _ elseS => do
@@ -381,76 +647,156 @@ partial def ofStatement : JSStatement → ConvM MiniStatement
   | .JSEmptyStatement _ => pure .empty
   | .JSExpressionStatement e _ => do pure (.expr (← ofExpression e))
   | .JSAssignStatement lhs op rhs _ => do
-      pure (.expr (.assign (← ofExpression lhs) (← assignOp op) (← ofExpression rhs)))
+      if isPatternLhs lhs && isSimpleAssign op then
+        pure (.expr (.assignPattern (← ofPattern lhs) (← ofExpression rhs)))
+      else pure (.expr (.assign (← ofExpression lhs) (← assignOp op) (← ofExpression rhs)))
   | .JSMethodCall e _ args _ _ => do
-      pure (.expr (.call (← ofExpression e) (← (fromCommaList args).mapM ofExpression)))
+      pure (.expr (.call (← ofExpression e) (← ofExprsRev args).reverse))
   | .JSReturn _ e _ => do
       match e with
       | none => pure (.return_ none)
       | some e => pure (.return_ (some (← ofExpression e)))
   | .JSSwitch _ _ e _ _ parts _ _ => do
-      pure (.switch (← ofExpression e) (← parts.mapM ofSwitchPart))
+      pure (.switch (← ofExpression e) (← ofSwitchParts parts))
   | .JSThrow _ e _ => do pure (.throw (← ofExpression e))
   | .JSTry _ body catches fin => do
-      pure (.try_ (← ofBlockBody body) (← ofTryTail catches fin))
+      let body ← ofBlockBody body
+      let fin ← ofFinally fin
+      let tail ← match ← ofCatches catches with
+        | [] =>
+            match fin with
+            | .some f => pure (MiniTryTail.finallyOnly f)
+            | .none => .error "MiniAST: try without catch or finally"
+        | c :: cs => pure (.catches ⟨c, cs⟩ fin)
+      pure (.try_ body tail)
   | .JSWhile _ _ cond _ body => do pure (.while_ (← ofExpression cond) (← ofStatement body))
   | .JSWith _ _ e _ body _ => do pure (.with_ (← ofExpression e) (← ofStatement body))
 
 end
 
+/-- The body of an arrow function. -/
+def ofArrowBody : JSStatement → ConvM MiniArrowBody
+  | .JSStatementBlock _ stmts _ _ => do pure (.block (← ofStatements stmts))
+  | .JSExpressionStatement e _ => do pure (.expr (← ofExpression e))
+  | s => do pure (.block [← ofStatement s])
+
+/-- A parameter: a pattern, or a rest parameter. -/
+def ofParam (e : JSExpression) : ConvM MiniParam := do
+  let p ← ofPattern e
+  pure (if isRestElem e then .rest p else .plain p)
+
+/-- The parameters of a function. -/
+def ofParams (ps : JSCommaList JSExpression) : ConvM (List MiniParam) := do
+  pure (← ofParamsRev ps).reverse
+
+/-- One declarator of a `var`, `let` or `const` statement. -/
+def ofDeclarator : JSExpression → ConvM MiniDeclarator
+  | .JSVarInitExpression lhs .JSVarInitNone => do pure ⟨← ofPattern lhs, none⟩
+  | .JSVarInitExpression lhs (.JSVarInit _ e) => do
+      pure ⟨← ofPattern lhs, some (← ofExpression e)⟩
+  | e => do pure ⟨← ofPattern e, none⟩
+
+/-- The declarators of a `var`, `let` or `const`. -/
+def ofDeclarators (decls : JSCommaList1 JSExpression) : ConvM (NEList MiniDeclarator) := do
+  pure (← ofDeclaratorsRev decls).reverse
+
+/-- Combine a comma separated list of expressions into a single expression
+with the comma operator. -/
+def ofExpressionList (xs : JSCommaList JSExpression) : ConvM (Option MiniExpr) := do
+  pure (seqOf (← ofExprsRev xs).reverse)
+
+/-- What follows the block of a `try`. -/
+def ofTryTail (catches : List JSTryCatch) (fin : JSTryFinally) : ConvM MiniTryTail := do
+  let fin ← ofFinally fin
+  match ← ofCatches catches with
+  | [] =>
+      match fin with
+      | .some body => pure (.finallyOnly body)
+      | .none => .error "MiniAST: try without catch or finally"
+  | c :: cs => pure (.catches ⟨c, cs⟩ fin)
+
 /-! ## Modules -/
 
-private def ofImportSpecifier : JSImportSpecifier → ConvM MiniSpecifier
+private def ofImportSpecifier : JSImportSpecifier → ConvM Specifier
   | .JSImportSpecifier i => do pure ⟨← identName "import specifier" i, none⟩
   | .JSImportSpecifierAs i _ a => do
       pure ⟨← identName "import specifier" i, some (← identName "import alias" a)⟩
 
-private def ofExportSpecifier : JSExportSpecifier → ConvM MiniSpecifier
+private def ofExportSpecifier : JSExportSpecifier → ConvM Specifier
   | .JSExportSpecifier i => do pure ⟨← identName "export specifier" i, none⟩
   | .JSExportSpecifierAs i _ a => do
       pure ⟨← identName "export specifier" i, some (← identName "export alias" a)⟩
 
-private def ofFromClause : JSFromClause → ConvM NEString
-  | .JSFromClause _ _ mod => nonempty "module name" (decodeStringLiteral mod)
+/-- One import attribute; the key and the value hold the characters they
+denote, so a key written as an identifier and the same key written as a
+string literal give the same attribute. -/
+private def ofImportAttribute : JSImportAttribute → ImportAttr
+  | .JSImportAttribute _ k _ _ v =>
+      ⟨decodeStringLiteral k.val, decodeStringLiteral v.val⟩
 
-private def ofImportsNamed : JSImportsNamed → ConvM (List MiniSpecifier)
+private def ofImportAttributes? : Option JSImportAttributes → List ImportAttr
+  | none => []
+  | some (.JSImportAttributes _ _ attrs _) => (fromCommaList attrs).map ofImportAttribute
+
+/-- The module of a `from` clause, and its import attributes. -/
+private def ofFromClauseWith : JSFromClause → ConvM (NEString × List ImportAttr)
+  | .JSFromClause _ _ mod attrs => do
+      pure (← nonempty "module name" (decodeStringLiteral mod.val), ofImportAttributes? attrs)
+
+private def ofFromClause (f : JSFromClause) : ConvM NEString := do
+  pure (← ofFromClauseWith f).1
+
+private def ofImportsNamed : JSImportsNamed → ConvM (List Specifier)
   | .JSImportsNamed _ specs _ => (fromCommaList specs).mapM ofImportSpecifier
 
 private def ofImportNameSpace : JSImportNameSpace → ConvM NEString
   | .JSImportNameSpace _ _ i => identName "namespace import" i
 
-private def importClause (mod : NEString) (default_ namespace_ : Option NEString)
-    (named : Option (List MiniSpecifier)) : ConvM MiniImportDeclaration :=
-  match MiniImportClause.mk? default_ namespace_ named mod with
+private def importClause (mod : NEString) (attrs : List ImportAttr)
+    (default_ namespace_ : Option NEString)
+    (named : Option (List Specifier)) : ConvM MiniImportDeclaration :=
+  match MiniImportClause.mk? default_ namespace_ named mod attrs with
   | some c => pure (.clause c)
   | none => .error "MiniAST: import without a binding"
 
-private def ofImportClause (mod : NEString) : JSImportClause → ConvM MiniImportDeclaration
+private def ofImportClause (mod : NEString) (attrs : List ImportAttr) :
+    JSImportClause → ConvM MiniImportDeclaration
   | .JSImportClauseDefault i => do
-      importClause mod (some (← identName "default import" i)) none none
+      importClause mod attrs (some (← identName "default import" i)) none none
   | .JSImportClauseNameSpace ns => do
-      importClause mod none (some (← ofImportNameSpace ns)) none
+      importClause mod attrs none (some (← ofImportNameSpace ns)) none
   | .JSImportClauseNamed named => do
-      importClause mod none none (some (← ofImportsNamed named))
+      importClause mod attrs none none (some (← ofImportsNamed named))
   | .JSImportClauseDefaultNameSpace i _ ns => do
-      importClause mod (some (← identName "default import" i))
+      importClause mod attrs (some (← identName "default import" i))
         (some (← ofImportNameSpace ns)) none
   | .JSImportClauseDefaultNamed i _ named => do
-      importClause mod (some (← identName "default import" i)) none
+      importClause mod attrs (some (← identName "default import" i)) none
         (some (← ofImportsNamed named))
 
 private def ofImportDeclaration : JSImportDeclaration → ConvM MiniImportDeclaration
-  | .JSImportDeclarationBare _ mod _ => do
-      pure (.bare (← nonempty "module name" (decodeStringLiteral mod)))
-  | .JSImportDeclaration clause from_ _ => do ofImportClause (← ofFromClause from_) clause
+  | .JSImportDeclarationBare _ mod attrs _ => do
+      pure (.bare (← nonempty "module name" (decodeStringLiteral mod.val))
+        (ofImportAttributes? attrs))
+  | .JSImportDeclaration clause from_ _ => do
+      let (mod, attrs) ← ofFromClauseWith from_
+      ofImportClause mod attrs clause
 
-private def ofExportClause : JSExportClause → ConvM (List MiniSpecifier)
+private def ofExportClause : JSExportClause → ConvM (List Specifier)
   | .JSExportClause _ specs _ => (fromCommaList specs).mapM ofExportSpecifier
 
 private def ofExportDeclaration : JSExportDeclaration → ConvM MiniExportDeclaration
   | .JSExportFrom clause from_ _ => do
-      pure (.fromClause (← ofExportClause clause) (← ofFromClause from_))
+      let (mod, attrs) ← ofFromClauseWith from_
+      pure (.fromClause (← ofExportClause clause) mod attrs)
   | .JSExportLocals clause _ => do pure (.locals (← ofExportClause clause))
+  | .JSExportAll _ from_ _ => do
+      let (mod, attrs) ← ofFromClauseWith from_
+      pure (.all none mod attrs)
+  | .JSExportAllAs _ _ i from_ _ => do
+      let (mod, attrs) ← ofFromClauseWith from_
+      pure (.all (some (← identName "namespace export" i)) mod attrs)
+  | .JSExportDefault _ e _ => do pure (.defaultExpr (← ofExpression e))
   | .JSExport stmt _ => do pure (.decl (← ofStatement stmt))
 
 def ofModuleItem : JSModuleItem → ConvM MiniModuleItem
@@ -470,11 +816,11 @@ def ofAST : JSAST → ConvM MiniProgram
 /-- Parse JavaScript source into a `MiniProgram`.  Both `import`/`export`
 declarations and plain statements are accepted. -/
 def parse (input : String) : Except String MiniProgram := do
-  ofAST (← Parser.parseModule input)
+  ofAST (← Language.JavaScript.Parser.parseModule input)
 
 /-- Parse a single expression into a `MiniExpr`. -/
 def parseExpr (input : String) : Except String MiniExpr := do
-  match ← Parser.parseExpressionAST input with
+  match ← Language.JavaScript.Parser.parseExpressionAST input with
   | .JSAstExpression e _ => ofExpression e
   | _ => .error "MiniAST: expected an expression"
 

@@ -1,5 +1,5 @@
 /-
-A JavaScript lexer producing the tokens of `LanguageJavaScript.Parser.Token`.
+A JavaScript lexer producing the tokens of `Language.JavaScript.Parser.Token`.
 
 The Haskell package generates its lexer with Alex; this is a hand written
 equivalent.  As in the original, whitespace and comments occurring before a
@@ -29,9 +29,9 @@ Implementation notes (performance):
 -/
 import LanguageJavascript.Token
 
-namespace LanguageJavaScript.Parser.Lexer
+namespace Language.JavaScript.Parser.Lexer
 
-open LanguageJavaScript.Parser
+open Language.JavaScript.Parser
 
 /-- The state of the lexer: the input, as a `Substring`, and the current
 position in it.
@@ -104,6 +104,45 @@ def skip (s : LexState) : Nat → LexState
 `Substring` of the input: no copying takes place. -/
 @[inline] def textFrom (s : LexState) (start : String.Pos.Raw) : Substring.Raw :=
   ⟨s.input.str, start, s.pos⟩
+
+/-! ### The measure that makes the scanners total
+
+Every scanner below advances by at least one character per step, and stops
+at the end of the input; `remaining` — the number of bytes left — is
+therefore a measure on which they are well founded, so none of them has to
+be `partial`. -/
+
+/-- The number of bytes of the input which are still to be read. -/
+@[inline] def remaining (s : LexState) : Nat := s.input.stopPos.byteIdx - s.pos.byteIdx
+
+/-- Consuming a character which is there reads at least one byte. -/
+theorem remaining_next_lt {s : LexState} (h : ¬ s.atEnd = true) :
+    s.next.remaining < s.remaining := by
+  have hlt : s.pos.byteIdx < s.input.stopPos.byteIdx := by
+    simp only [atEnd, decide_eq_true_eq, Nat.not_le] at h
+    exact h
+  have hstep := String.Pos.Raw.byteIdx_lt_byteIdx_next s.input.str s.pos
+  simp only [next, h, Bool.false_eq_true, ↓reduceIte, remaining]
+  repeat' split
+  all_goals dsimp only; omega
+
+/-- Consuming a character never reads past the end. -/
+theorem remaining_next_le (s : LexState) : s.next.remaining ≤ s.remaining := by
+  by_cases h : s.atEnd = true
+  · simp [next, h]
+  · exact Nat.le_of_lt (remaining_next_lt h)
+
+/-- Consuming two characters, the first of which is there, reads at least
+one byte. -/
+theorem remaining_next_next_lt {s : LexState} (h : ¬ s.atEnd = true) :
+    s.next.next.remaining < s.remaining :=
+  Nat.lt_of_le_of_lt (remaining_next_le _) (remaining_next_lt h)
+
+/-- There is a character at the current position exactly when the input is
+not exhausted. -/
+theorem not_atEnd_of_cur {s : LexState} {c : Char} (h : s.cur = some c) : ¬ s.atEnd = true := by
+  intro he
+  simp [cur, he] at h
 
 /-- Does the input continue with `str` at the current position? -/
 @[inline] def startsWith (s : LexState) (str : String) : Bool :=
@@ -252,12 +291,14 @@ def punctuatorAt (s : LexState) (c : Char) : Option (Nat × TokenKind) :=
       else some (1, .DotToken)
   | '&' =>
       let c1 := s.charAt 1
-      if c1 == '&' then some (2, .AndToken)
+      if c1 == '&' then
+        if s.charAt 2 == '=' then some (3, .LogicalAndAssignToken) else some (2, .AndToken)
       else if c1 == '=' then some (2, .AndAssignToken)
       else some (1, .BitwiseAndToken)
   | '|' =>
       let c1 := s.charAt 1
-      if c1 == '|' then some (2, .OrToken)
+      if c1 == '|' then
+        if s.charAt 2 == '=' then some (3, .LogicalOrAssignToken) else some (2, .OrToken)
       else if c1 == '=' then some (2, .OrAssignToken)
       else some (1, .BitwiseOrToken)
   | '+' =>
@@ -275,7 +316,15 @@ def punctuatorAt (s : LexState) (c : Char) : Option (Nat × TokenKind) :=
   | '%' => if s.charAt 1 == '=' then some (2, .ModAssignToken) else some (1, .ModToken)
   | '^' => if s.charAt 1 == '=' then some (2, .XorAssignToken) else some (1, .BitwiseXorToken)
   | '~' => some (1, .BitwiseNotToken)
-  | '?' => some (1, .HookToken)
+  | '@' => some (1, .AtToken)
+  | '?' =>
+      let c1 := s.charAt 1
+      if c1 == '?' then
+        if s.charAt 2 == '=' then some (3, .NullishAssignToken) else some (2, .NullishToken)
+      -- `?.` is the optional chaining operator, but `x?.5:y` is a
+      -- conditional whose branch is `.5`, so a digit after the dot wins
+      else if c1 == '.' && !(s.charAt 2).isDigit then some (2, .OptionalChainToken)
+      else some (1, .HookToken)
   | ':' => some (1, .ColonToken)
   | ';' => some (1, .SemiColonToken)
   | ',' => some (1, .CommaToken)
@@ -288,10 +337,12 @@ def punctuatorAt (s : LexState) (c : Char) : Option (Nat × TokenKind) :=
   | _ => none
 
 /-- Consume characters while the predicate holds. -/
-partial def scanWhile (p : Char → Bool) (t : LexState) : LexState :=
-  match t.cur with
+def scanWhile (p : Char → Bool) (t : LexState) : LexState :=
+  match _h : t.cur with
   | none => t
   | some ch => if p ch then scanWhile p t.next else t
+termination_by t.remaining
+decreasing_by exact LexState.remaining_next_lt (LexState.not_atEnd_of_cur _h)
 
 /-- Is this character a line terminator? -/
 def isLineTerminator (c : Char) : Bool :=
@@ -305,21 +356,63 @@ def isWhitespace (c : Char) : Bool :=
     || isLineTerminator c
 
 /-- Consume the rest of a line comment. -/
-partial def scanLineComment (t : LexState) : LexState :=
-  match t.cur with
+def scanLineComment (t : LexState) : LexState :=
+  match _h : t.cur with
   | none => t
   | some ch => if isLineTerminator ch then t else scanLineComment t.next
+termination_by t.remaining
+decreasing_by exact LexState.remaining_next_lt (LexState.not_atEnd_of_cur _h)
 
 /-- Consume the rest of a block comment, including the closing `*/`. -/
-partial def scanBlockComment (t : LexState) : Except String LexState :=
-  if t.atEnd then .error (lexError t)
+def scanBlockComment (t : LexState) : Except String LexState :=
+  if _h : t.atEnd then .error (lexError t)
   else if t.startsWith "*/" then .ok (t.skip 2)
   else scanBlockComment t.next
+termination_by t.remaining
+decreasing_by exact LexState.remaining_next_lt _h
 
-/-- Skip whitespace and comments, collecting the comments (in reverse). -/
-partial def skipTriviaAux (s : LexState) (acc : List CommentAnnotation) :
+/-- Scanning a line comment never reads past the end of the input. -/
+theorem scanLineComment_remaining_le (t : LexState) :
+    (scanLineComment t).remaining ≤ t.remaining := by
+  induction t using scanLineComment.induct with
+  | case1 t h => rw [scanLineComment]; split <;> simp_all
+  | case2 t ch h hterm => rw [scanLineComment]; split <;> simp_all
+  | case3 t ch h hterm ih =>
+      rw [scanLineComment]
+      split
+      · exact Nat.le_refl _
+      · rename_i ch' hc'
+        have hch : ch = ch' := Option.some.inj (h.symm.trans hc')
+        subst hch
+        simp only [hterm, Bool.false_eq_true, ↓reduceIte]
+        exact Nat.le_trans ih (LexState.remaining_next_le t)
+
+/-- Scanning a block comment never reads past the end of the input. -/
+theorem scanBlockComment_remaining_le {t u : LexState} (h : scanBlockComment t = .ok u) :
+    u.remaining ≤ t.remaining := by
+  induction t using scanBlockComment.induct generalizing u with
+  | case1 t ht => rw [scanBlockComment] at h; simp [ht] at h
+  | case2 t ht hstar =>
+      rw [scanBlockComment] at h
+      simp only [ht, Bool.false_eq_true, ↓reduceDIte, hstar, ↓reduceIte, Except.ok.injEq] at h
+      subst h
+      show (t.next.next).remaining ≤ t.remaining
+      exact Nat.le_trans (LexState.remaining_next_le _) (LexState.remaining_next_le t)
+  | case3 t ht hstar ih =>
+      rw [scanBlockComment] at h
+      simp only [ht, Bool.false_eq_true, ↓reduceDIte, hstar, ↓reduceIte] at h
+      exact Nat.le_trans (ih h) (LexState.remaining_next_le t)
+
+/-- Skip whitespace and comments, collecting the comments (in reverse).
+
+The loop is well founded on `LexState.remaining`, the number of bytes left:
+a step either consumes a whitespace character or scans a comment, and a
+comment starts with two characters which are there, so every step reads at
+least one byte.  There is no step counter, so the scan is driven by the
+input alone. -/
+def skipTriviaAux (s : LexState) (acc : List CommentAnnotation) :
     Except String (List CommentAnnotation × LexState) :=
-  match s.cur with
+  match _hc : s.cur with
   | none => .ok (acc, s)
   | some c =>
     if isWhitespace c then
@@ -327,16 +420,23 @@ partial def skipTriviaAux (s : LexState) (acc : List CommentAnnotation) :
     else if c == '/' && s.charAt 1 == '/' then
       let start := s.pos
       let p := s.posn
-      let t := scanLineComment s
+      let t := scanLineComment s.next
       skipTriviaAux t (.CommentA p (t.textFrom start) :: acc)
     else if c == '/' && s.charAt 1 == '*' then
       let start := s.pos
       let p := s.posn
-      match scanBlockComment (s.skip 2) with
+      match _ht : scanBlockComment (s.skip 2) with
       | .error e => .error e
       | .ok t => skipTriviaAux t (.CommentA p (t.textFrom start) :: acc)
     else
       .ok (acc, s)
+termination_by s.remaining
+decreasing_by
+  · exact LexState.remaining_next_lt (LexState.not_atEnd_of_cur _hc)
+  · exact Nat.lt_of_le_of_lt (scanLineComment_remaining_le s.next)
+      (LexState.remaining_next_lt (LexState.not_atEnd_of_cur _hc))
+  · exact Nat.lt_of_le_of_lt (scanBlockComment_remaining_le _ht)
+      (LexState.remaining_next_next_lt (LexState.not_atEnd_of_cur _hc))
 
 /-- Skip whitespace and comments, collecting the comments in source order. -/
 @[inline] def skipTrivia (s : LexState) :
@@ -345,8 +445,8 @@ partial def skipTriviaAux (s : LexState) (acc : List CommentAnnotation) :
   return (acc.reverse, t)
 
 /-- Read a string literal, including its quotes. -/
-partial def scanString (quote : Char) (t : LexState) : Except String LexState :=
-  match t.cur with
+def scanString (quote : Char) (t : LexState) : Except String LexState :=
+  match _h : t.cur with
   | none => .error (lexError t)
   | some c =>
     if c == quote then .ok t.next
@@ -356,6 +456,10 @@ partial def scanString (quote : Char) (t : LexState) : Except String LexState :=
       | none => .error (lexError t.next)
       | some _ => scanString quote t.next.next
     else scanString quote t.next
+termination_by t.remaining
+decreasing_by
+  · exact LexState.remaining_next_next_lt (LexState.not_atEnd_of_cur _h)
+  · exact LexState.remaining_next_lt (LexState.not_atEnd_of_cur _h)
 
 def lexString (s : LexState) (quote : Char) : Except String LexState :=
   scanString quote s.next
@@ -364,8 +468,8 @@ def lexString (s : LexState) (quote : Char) : Except String LexState :=
 
 As in the Alex lexer of the Haskell package, a character class runs up to the
 first `]`; a backslash inside a class does not escape it. -/
-partial def scanRegex (inClass : Bool) (t : LexState) : Except String LexState :=
-  match t.cur with
+def scanRegex (inClass : Bool) (t : LexState) : Except String LexState :=
+  match _h : t.cur with
   | none => .error (lexError t)
   | some c =>
     if c == '\n' then .error (lexError t)
@@ -378,6 +482,13 @@ partial def scanRegex (inClass : Bool) (t : LexState) : Except String LexState :
     else if c == '[' then scanRegex true t.next
     else if c == '/' then .ok (scanWhile isIdentPart t.next)
     else scanRegex false t.next
+termination_by t.remaining
+decreasing_by
+  · exact LexState.remaining_next_lt (LexState.not_atEnd_of_cur _h)
+  · exact LexState.remaining_next_lt (LexState.not_atEnd_of_cur _h)
+  · exact LexState.remaining_next_next_lt (LexState.not_atEnd_of_cur _h)
+  · exact LexState.remaining_next_lt (LexState.not_atEnd_of_cur _h)
+  · exact LexState.remaining_next_lt (LexState.not_atEnd_of_cur _h)
 
 /-- Read a regular expression literal, including the delimiters and flags. -/
 def lexRegex (s : LexState) : Except String LexState := scanRegex false s.next
@@ -402,8 +513,8 @@ def lexNumber (s : LexState) : Except String (TokenKind × LexState) :=
     .ok (.DecimalToken, t)
 
 /-- Read a template literal head (or a template with no substitution). -/
-partial def scanTemplateStart (t : LexState) : Except String (TokenKind × LexState) :=
-  match t.cur with
+def scanTemplateStart (t : LexState) : Except String (TokenKind × LexState) :=
+  match _h : t.cur with
   | none => .error (lexError t)
   | some c =>
     if c == '\\' then
@@ -413,14 +524,18 @@ partial def scanTemplateStart (t : LexState) : Except String (TokenKind × LexSt
     else if c == '`' then .ok (.NoSubstitutionTemplateToken, t.next)
     else if c == '$' && t.charAt 1 == '{' then .ok (.TemplateHeadToken, t.skip 2)
     else scanTemplateStart t.next
+termination_by t.remaining
+decreasing_by
+  · exact LexState.remaining_next_next_lt (LexState.not_atEnd_of_cur _h)
+  · exact LexState.remaining_next_lt (LexState.not_atEnd_of_cur _h)
 
 def lexTemplateStart (s : LexState) : Except String (TokenKind × LexState) :=
   scanTemplateStart s.next
 
 /-- Read the continuation of a template literal, after the `}` that closes a
 substitution. -/
-partial def lexTemplateContinue (t : LexState) : Except String (TokenKind × LexState) :=
-  match t.cur with
+def lexTemplateContinue (t : LexState) : Except String (TokenKind × LexState) :=
+  match _h : t.cur with
   | none => .error (lexError t)
   | some c =>
     if c == '\\' then
@@ -430,6 +545,10 @@ partial def lexTemplateContinue (t : LexState) : Except String (TokenKind × Lex
     else if c == '`' then .ok (.TemplateTailToken, t.next)
     else if c == '$' && t.charAt 1 == '{' then .ok (.TemplateMiddleToken, t.skip 2)
     else lexTemplateContinue t.next
+termination_by t.remaining
+decreasing_by
+  · exact LexState.remaining_next_next_lt (LexState.not_atEnd_of_cur _h)
+  · exact LexState.remaining_next_lt (LexState.not_atEnd_of_cur _h)
 
 /-- Read the next token. -/
 def lexToken (mode : LexMode) (s0 : LexState) : Except String (Token × LexState) := do
@@ -453,6 +572,10 @@ def lexToken (mode : LexMode) (s0 : LexState) : Except String (Token × LexState
       match keywordKindSub (t.textFrom start) with
       | some k => return mk k t
       | none => return mk .IdentifierToken t
+    else if c == '#' && isIdentStart (s.charAt 1) then
+      -- a private class name, `#x`; its text includes the `#`
+      let t := scanWhile isIdentPart (s.skip 2)
+      return mk .PrivateNameToken t
     else if c.isDigit || (c == '.' && (s.charAt 1).isDigit) then
       let (kind, t) ← lexNumber s
       return mk kind t
@@ -470,4 +593,4 @@ def lexToken (mode : LexMode) (s0 : LexState) : Except String (Token × LexState
       | some (n, kind) => return mk kind (s.skip n)
       | none => .error (lexError s)
 
-end LanguageJavaScript.Parser.Lexer
+end Language.JavaScript.Parser.Lexer

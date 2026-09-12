@@ -4,13 +4,14 @@ Port of the Haskell test module `LiteralParser`.
 import Spec
 import LanguageJavascript.Parser
 import LanguageJavascript.AST
+import LanguageJavascript.ShowStripped
 
 namespace LanguageJavascriptTests.LiteralParser
 
 open Spec
 open Spec.Assert
-open LanguageJavaScript.Parser
-open LanguageJavaScript.Parser.AST
+open Language.JavaScript.Parser
+open Language.JavaScript.Parser.AST
 
 def escapeLabel (s : String) : String :=
   s.replace "\n" "\\n" |>.replace "\r" "\\r"
@@ -57,29 +58,29 @@ def literalCases : List (String × String) :=
   [ ("null", "Right (JSAstLiteral (JSLiteral 'null'))")
   , ("false", "Right (JSAstLiteral (JSLiteral 'false'))")
   , ("true", "Right (JSAstLiteral (JSLiteral 'true'))")
-  -- hex numbers
-  , ("0x1234fF", "Right (JSAstLiteral (JSHexInteger '0x1234fF'))")
-  , ("0X1234fF", "Right (JSAstLiteral (JSHexInteger '0X1234fF'))")
+  -- hex numbers; a literal is read as its value and shown canonically
+  , ("0x1234fF", "Right (JSAstLiteral (JSHexInteger '0x1234ff'))")
+  , ("0X1234fF", "Right (JSAstLiteral (JSHexInteger '0x1234ff'))")
   -- decimal numbers
-  , ("1.0e4", "Right (JSAstLiteral (JSDecimal '1.0e4'))")
-  , ("2.3E6", "Right (JSAstLiteral (JSDecimal '2.3E6'))")
+  , ("1.0e4", "Right (JSAstLiteral (JSDecimal '10000'))")
+  , ("2.3E6", "Right (JSAstLiteral (JSDecimal '2300000'))")
   , ("4.5", "Right (JSAstLiteral (JSDecimal '4.5'))")
-  , ("0.7e8", "Right (JSAstLiteral (JSDecimal '0.7e8'))")
-  , ("0.7E8", "Right (JSAstLiteral (JSDecimal '0.7E8'))")
+  , ("0.7e8", "Right (JSAstLiteral (JSDecimal '70000000'))")
+  , ("0.7E8", "Right (JSAstLiteral (JSDecimal '70000000'))")
   , ("10", "Right (JSAstLiteral (JSDecimal '10'))")
   , ("0", "Right (JSAstLiteral (JSDecimal '0'))")
   , ("0.03", "Right (JSAstLiteral (JSDecimal '0.03'))")
-  , ("0.7e+8", "Right (JSAstLiteral (JSDecimal '0.7e+8'))")
-  , ("0.7e-18", "Right (JSAstLiteral (JSDecimal '0.7e-18'))")
-  , ("1.0e+4", "Right (JSAstLiteral (JSDecimal '1.0e+4'))")
-  , ("1.0e-4", "Right (JSAstLiteral (JSDecimal '1.0e-4'))")
-  , ("1e18", "Right (JSAstLiteral (JSDecimal '1e18'))")
-  , ("1e+18", "Right (JSAstLiteral (JSDecimal '1e+18'))")
+  , ("0.7e+8", "Right (JSAstLiteral (JSDecimal '70000000'))")
+  , ("0.7e-18", "Right (JSAstLiteral (JSDecimal '7e-19'))")
+  , ("1.0e+4", "Right (JSAstLiteral (JSDecimal '10000'))")
+  , ("1.0e-4", "Right (JSAstLiteral (JSDecimal '0.0001'))")
+  , ("1e18", "Right (JSAstLiteral (JSDecimal '1000000000000000000'))")
+  , ("1e+18", "Right (JSAstLiteral (JSDecimal '1000000000000000000'))")
   , ("1e-18", "Right (JSAstLiteral (JSDecimal '1e-18'))")
-  , ("1E-01", "Right (JSAstLiteral (JSDecimal '1E-01'))")
-  -- octal numbers
-  , ("070", "Right (JSAstLiteral (JSOctal '070'))")
-  , ("010234567", "Right (JSAstLiteral (JSOctal '010234567'))")
+  , ("1E-01", "Right (JSAstLiteral (JSDecimal '0.1'))")
+  -- octal numbers, including the legacy spelling
+  , ("070", "Right (JSAstLiteral (JSOctal '0o70'))")
+  , ("010234567", "Right (JSAstLiteral (JSOctal '0o10234567'))")
   -- strings
   , ("'cat'", "Right (JSAstLiteral (JSStringLiteral 'cat'))")
   , ("\"cat\"", "Right (JSAstLiteral (JSStringLiteral \"cat\"))")

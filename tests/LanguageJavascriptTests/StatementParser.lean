@@ -4,13 +4,14 @@ Port of the Haskell test module `StatementParser`.
 import Spec
 import LanguageJavascript.Parser
 import LanguageJavascript.AST
+import LanguageJavascript.ShowStripped
 
 namespace LanguageJavascriptTests.StatementParser
 
 open Spec
 open Spec.Assert
-open LanguageJavaScript.Parser
-open LanguageJavaScript.Parser.AST
+open Language.JavaScript.Parser
+open Language.JavaScript.Parser.AST
 
 def escapeLabel (s : String) : String :=
   s.replace "\n" "\\n" |>.replace "\r" "\\r"

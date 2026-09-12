@@ -3,7 +3,7 @@ A synthetic JavaScript source of arbitrary size, used by the benchmark
 (`lake exe bench`) and by the large input test of the test suite.
 -/
 
-namespace LanguageJavaScriptBench.Sample
+namespace LanguageJavascriptBench.Sample
 
 /-- One chunk of the synthetic input: a mixture of the constructs the lexer
 has to deal with (identifiers, keywords, numbers, strings, comments,
@@ -24,4 +24,4 @@ def chunk : String :=
 def source (n : Nat) : String :=
   String.join ((List.range n).map (fun i => chunk.replace "NN" (toString i)))
 
-end LanguageJavaScriptBench.Sample
+end LanguageJavascriptBench.Sample

@@ -13,9 +13,11 @@ level `N`, `_mN` the mutable one, and a name that stayed a name is one that
 was not bound anywhere (the `unsafeGlobal` escape hatch).
 -/
 import Spec
+import Mathlib.Data.Finset.Card
 import LanguageJavascriptBrujin.AST
 import LanguageJavascriptBrujin.OfMini
 import LanguageJavascriptBrujin.ToMini
+import LanguageJavascriptBrujin.Weaken
 
 namespace LanguageJavascriptTests.Brujin.AST
 
@@ -112,9 +114,26 @@ def resolveCases : List (String × String × String) :=
       "outer: while (x) {\n  continue outer;\n}\n")
   , ("holes and spread in an array literal",
       brujinRender "const xs = [1, , 2, ...rest];", "const _c0 = [1, , 2, ...rest];\n")
+    -- a parameter is recorded as ordinary or as the rest parameter, and the
+    -- printer writes the `...` back
+  , ("a rest parameter of a function",
+      brujinRender "function f(a, ...xs) { return xs; }",
+      "function _c0(_m0, ..._m1) {\n  return _m1;\n}\n")
+  , ("a rest parameter of an arrow",
+      brujinRender "const g = (...xs) => xs;", "const _c0 = (..._m0) => _m0;\n")
+  , ("a rest parameter of a method",
+      brujinRender "const o = { m(...as) { return as; } };",
+      "const _c0 = {\n  m(..._m0) {\n    return _m0;\n  },\n};\n")
   , ("an empty statement is dropped",
       brujinRender "f();;;g();", "f();\ng();\n")
   , ("throw", brujinRender "throw new Error('x');", "throw new Error(\"x\");\n")
+    -- a label may carry a declaration, and what it declares is in scope
+    -- after it
+  , ("a labelled declaration", brujinRender "l: let x = 1; g(x);",
+      "l: let _m0 = 1;\ng(_m0);\n")
+  , ("a labelled function declaration",
+      brujinRender "l: function f() { return 1; } f();",
+      "l: function _c0() {\n  return 1;\n}\n_c0();\n")
   ]
 
 /-! ## The conversion is faithful
@@ -149,6 +168,8 @@ def brujinStableSources : List String :=
   , "const o = {}; o.x = 1; o['y']++; --o.z;"
   , "label: { f(); } outer: while (x) { continue outer; }"
   , "function* gen(a, b) { yield a; yield* b; }"
+  , "function f(a, ...xs) { return xs; } const g = (...ys) => ys;"
+  , "class C { m(a, ...rest) { return rest; } }"
   ]
 
 /-! ## What the scope safe AST rules out -/
@@ -159,15 +180,16 @@ def errorCases : List (String × String × String) :=
   , ("a destructuring binder", brujinRender "var {a, b} = obj;",
       "ERROR: BrujinAST: a destructuring pattern in a binder")
   , ("a default parameter value", brujinRender "function f(a = 1) {}",
-      "ERROR: BrujinAST: a default value in a binder")
+      "ERROR: BrujinAST: a default value in a parameter")
   , ("with", brujinRender "with (o) { f(); }",
       "ERROR: BrujinAST: a `with` statement (its scope is dynamic)")
   , ("a catch guard", brujinRender "try { a() } catch (e if b) { c() }",
       "ERROR: BrujinAST: a catch clause with a guard")
   , ("a for clause with two declarators", brujinRender "for (let i = 0, j = 1; i < j; i++) {}",
       "ERROR: BrujinAST: a `for` clause that declares several variables")
-  , ("a labelled declaration", brujinRender "l: let x = 1;",
-      "ERROR: BrujinAST: a labelled statement that declares a variable")
+  , ("a rest parameter which is not the last one",
+      brujinRender "function f(...xs, y) { return y; }",
+      "ERROR: BrujinAST: a rest parameter which is not the last one")
   ]
 
 /-! ## Trees written by hand
@@ -175,23 +197,97 @@ def errorCases : List (String × String × String) :=
 A `BrujinAST` value is written directly, without going through source; the
 type of a variable is what keeps it in scope. -/
 
-/-- `(x) => x`, in the empty scope. -/
-def identityFn : Expr 0 0 := .arrow 1 (.expr (.mutVar 0))
+/-- The one unknown global the trees below mention. -/
+def printName : Language.JavaScript.NEString := ⟨"print", by decide⟩
+
+/-- The set of unknown globals of the trees below: the type of a tree lists
+every name it mentions and does not bind. -/
+def printGlobals : Finset Language.JavaScript.NEString := {printName}
+
+/-- `(x) => x`, in the empty scope, mentioning no global at all. -/
+def identityFn : Global.Expr 0 0 ∅ := .arrow 1 false (.expr (.mutVar 0))
 
 /-- `(x, y) => x + y`: the *first* parameter is the *last* index. -/
-def plusFn : Expr 0 0 := .arrow 2 (.expr (.binary (.mutVar 1) .plus (.mutVar 0)))
+def plusFn : Global.Expr 0 0 ∅ :=
+  .arrow 2 false (.expr (.binary (.mutVar 1) .plus (.mutVar 0)))
 
-/-- An expression that mentions the two variables of its scope and a
-global; it only typechecks in a scope with a const and a mutable one. -/
-def usesBoth : Expr 1 1 :=
-  .call (.unsafeGlobal ⟨"print", by decide⟩)
+/-- `(x, ...xs) => xs`: the tree records that there is a rest parameter,
+which is the last binder and so `mutVar 0`. -/
+def restFn : Global.Expr 0 0 ∅ := .arrow 1 true (.expr (.mutVar 0))
+
+/-- An expression that mentions the two variables of its scope and one
+global; it only typechecks in a scope with a const and a mutable variable,
+and only against a set of globals that has `print` in it. -/
+def usesBoth : Global.Expr 1 1 printGlobals :=
+  .call (.unsafeGlobal printName (Finset.mem_singleton_self _))
     (.cons (.binary (.constVar 0) .plus (.mutVar 0)) .nil)
 
 /-- `const x = 1; print(x);` -/
 def tinyProgram : Program :=
-  ⟨.cons (.stmt (.constDecl (.number ⟨"1", by decide⟩)))
-    (.cons (.stmt (.expr (.call (.unsafeGlobal ⟨"print", by decide⟩)
-      (.cons (.constVar 0) .nil)))) .nil)⟩
+  ⟨printGlobals,
+    .cons (.stmt (.constDecl (.number (Language.JavaScript.JSNumber.ofNat 1))))
+      (.cons (.stmt (.expr (.call (.unsafeGlobal printName (Finset.mem_singleton_self _))
+        (.cons (.constVar 0) .nil)))) .nil)⟩
+
+/-- The name `Math`, which is a free name like any other. -/
+def mathName : Language.JavaScript.NEString := ⟨"Math", by decide⟩
+
+/-- The set of unknown globals of `usesMath`. -/
+def mathGlobals : Finset Language.JavaScript.NEString := {mathName}
+
+/-- `Math.max(1, 2)`: `Math` is a name the tree does not bind, so it is one
+of the globals its type lists. -/
+def usesMath : Global.Expr 0 0 mathGlobals :=
+  .call (.dot (.unsafeGlobal mathName (Finset.mem_singleton_self _)) ⟨"max", by decide⟩)
+    (.cons (.number (Language.JavaScript.JSNumber.ofNat 1))
+      (.cons (.number (Language.JavaScript.JSNumber.ofNat 2)) .nil))
+
+/-! ## The set of globals
+
+A `Global.*` tree is instantiated at the set of names it mentions but
+does not bind.  Every free name goes in it, the standard ECMAScript globals
+included.  These cases read source and look at the set the conversion
+computed. -/
+
+/-- How many unknown globals does the program mention? -/
+def globalCount (src : String) : String :=
+  match parse src with
+  | .ok p => toString p.globals.card
+  | .error e => "ERROR: " ++ e
+
+/-- Is `name` one of the unknown globals of the program? -/
+def mentionsGlobal (src name : String) : String :=
+  match parse src with
+  | .ok p => toString (decide (Language.JavaScript.NEString.ofString! name ∈ p.globals))
+  | .error e => "ERROR: " ++ e
+
+def globalsCases : List (String × String × String) :=
+  [ ("a standard global is an unknown global too", globalCount "Math.max(1, 2);", "1")
+  , ("and so is JSON, counted once", globalCount "JSON.stringify(JSON.parse(\"1\"));", "1")
+  , ("the collections and the parsers each count",
+      globalCount "new Map([[1, new Set()]]); parseInt(\"3\", 10); isNaN(0);", "4")
+  , ("and so do the text and URL transformers",
+      globalCount "new TextDecoder().decode(new TextEncoder().encode(atob(s0)));", "4")
+  , ("an error type counts", globalCount "throw new TypeError(\"x\");", "1")
+  , ("two unrelated names count twice", globalCount "console.log(fetch(1));", "2")
+  , ("and it is the name itself", mentionsGlobal "console.log(fetch(1));" "console", "true")
+  , ("a standard name turns up there as well",
+      mentionsGlobal "console.log(Math.PI);" "Math", "true")
+  , ("a bound name is not a global", globalCount "const x = 1; x + x;", "0")
+  , ("the same unknown name twice counts once", globalCount "foo(foo(foo));", "1")
+  , ("a global is printed as itself", brujinRender "Math.max(x, 1);", "Math.max(x, 1);\n")
+  , ("a global can be assigned to", brujinRender "Math = 1;", "Math = 1;\n")
+  , ("and it can be incremented", brujinRender "JSON++;", "JSON++;\n")
+  , ("a member of one can be assigned to", brujinRender "Math.x = 1;", "Math.x = 1;\n")
+  ]
+
+/-! ## Weakening
+
+A tree built against `g` is a legal tree against any larger set. -/
+
+/-- The same expression as `usesBoth`, moved into a bigger set of globals. -/
+def usesBothWeakened : Global.Expr 1 1 (insert (Language.JavaScript.NEString.ofString! "other") printGlobals) :=
+  Expr.weaken (Finset.subset_insert _ _) usesBoth
 
 def spec : Spec := do
   describe "BrujinAST Scope Resolution" do
@@ -214,13 +310,31 @@ def spec : Spec := do
       shouldEqual (printExpr identityFn) "(_m0) => _m0"
     it "the first parameter has the last index" do
       shouldEqual (printExpr plusFn) "(_m0, _m1) => _m0 + _m1"
+    it "a rest parameter written by hand" do
+      shouldEqual (printExpr restFn) "(_m0, ..._m1) => _m1"
     it "an expression in a scope of its own" do
       shouldEqual (printExpr usesBoth) "print(_c0 + _m0)"
+    it "a free standard name is a global of the tree" do
+      shouldEqual (printExpr usesMath) "Math.max(1, 2)"
     it "a program written by hand" do
       shouldEqual (printProgram tinyProgram) "const _c0 = 1;\nprint(_c0);\n"
     it "and it reads back as itself" do
       shouldEqual (toString (match parse (printProgram tinyProgram) with
         | .ok q => q == tinyProgram
         | .error _ => false)) "true"
+
+  describe "BrujinAST Globals" do
+    for (label, actual, expected) in globalsCases do
+      it label do
+        shouldEqual actual expected
+
+  describe "BrujinAST Weakening" do
+    it "weakening does not change the tree" do
+      shouldEqual (printExpr usesBothWeakened) (printExpr usesBoth)
+    it "a program can be moved into a bigger set of globals" do
+      shouldEqual
+        (printProgram (tinyProgram.weakenTo
+          (Finset.subset_insert (Language.JavaScript.NEString.ofString! "other") _)))
+        (printProgram tinyProgram)
 
 end LanguageJavascriptTests.Brujin.AST

@@ -10,9 +10,9 @@ namespace LanguageJavascriptTests.Minify
 
 open Spec
 open Spec.Assert
-open LanguageJavaScript.Parser
-open LanguageJavaScript.Pretty
-open LanguageJavaScript.Process
+open Language.JavaScript.Parser
+open Language.JavaScript.Pretty
+open Language.JavaScript.Process
 
 def escapeLabel (s : String) : String :=
   s.replace "\n" "\\n" |>.replace "\r" "\\r"
@@ -70,6 +70,32 @@ def spec : Spec := do
     itProg "class Foo extends Bar { static a () { return 1 } ; b (x) {} }" "class Foo extends Bar{static a(){return 1}b(x){}}"
     -- objects
     itProg "a = { b : 1, c : 2, }" "a={b:1,c:2}"
+    -- statement lists: blocks are spliced, empty statements dropped,
+    -- neighbouring declarations merged
+    itProg "var a=1;;var b=2;" "var a=1,b=2"
+    itProg "{ var a = 1; var b = 2; }" "var a=1,b=2"
+    itProg "x(); { y(); z(); } w();" "x();y();z();w()"
+    itProg "{ ; }" ";"
+    itProg "{ { a(); } }" "a()"
+    itProg "{ ; a(); ; }" ";a();;"
+    itProg "if (a) { ; } else { ; }" "if(a){}else{}"
+    itProg "function a(){} ; function b(){}" "function a(){}\nfunction b(){}"
+    itProg "const a = 1; ; const b = 2;" "const a=1,b=2"
+    itProg "var a = 1; { } var b = 2;" "var a=1,b=2"
+    itProg "{ a(); }" "a()"
+    itProg "{ a(); b(); }" "a();b()"
+    itProg "while (a) { ; }" "while(a){}"
+    itProg "for (;;) { { x(); } }" "for(;;)x()"
+    itProg "var a=1,b=2; var c=3;" "var a=1,b=2,c=3"
+    itProg "switch(a){case 1: { b(); c(); } }" "switch(a){case 1:b();c()}"
+    itProg "try { ; } catch (e) { { f(); } }" "try{}catch(e){f()}"
+    itProg "label: { a(); b(); }" "label:{a();b()}"
+    itProg "if (a) b(); else { }" "if(a){b()}else;"
+    itProg "x(); ;" "x()"
+    itProg "{ var a = 1; }" "var a=1"
+    itProg "{ }; x();" "x()"
+    itProg "const a=1; var b=2; const c=3;" "const a=1;var b=2;const c=3"
+    itProg "function f(){ var a=1; var b=2; ; }" "function f(){var a=1,b=2}"
     -- modules
     itModule "import def from 'mod';\nexport { a as b };\nexport const x = 1 ;" "import def from'mod'export{a as b}export const x=1"
 

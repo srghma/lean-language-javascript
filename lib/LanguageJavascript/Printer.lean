@@ -1,10 +1,17 @@
 /-
-Port of `LanguageJavaScript.Pretty.Printer` to Lean 4.
+Port of `Language.JavaScript.Pretty.Printer` to Lean 4.
 
 The Haskell version accumulates into a `blaze-builder` `Builder` while
 keeping track of the current (row, column) so that the source positions
 stored in the annotations can be reproduced exactly.  Here the accumulator
 is a plain `String`.
+
+The layout of the input is reproduced; the spelling of a numeric and of a
+regular expression literal is not, since the tree stores the value and not
+the source text — such a literal is printed canonically (`0x1f`, `0o70`,
+`1.5`, `/x/gi`).  A literal which prints shorter than it was written leaves
+the following token at the column it was written at, so the padding shows
+up as whitespace.
 
 The Haskell code uses one overloaded operator `(|>)`; in Lean each instance
 becomes a separate function and the chains are written with the pipeline
@@ -12,10 +19,10 @@ operator, so the left to right reading order is preserved.
 -/
 import LanguageJavascript.AST
 
-namespace LanguageJavaScript.Pretty
+namespace Language.JavaScript.Pretty
 
-open LanguageJavaScript.Parser
-open LanguageJavaScript.Parser.AST
+open Language.JavaScript.Parser
+open Language.JavaScript.Parser.AST
 
 /-- Current position and output accumulated so far. -/
 structure PosAccum where
@@ -35,15 +42,23 @@ def s (p : PosAccum) (str : String) : PosAccum :=
   let (r, c) := str.foldl go (p.row, p.col)
   { row := r, col := c, out := p.out ++ str }
 
-/-- Emit the contents of a `Substring`, updating the current position. -/
-def sub (p : PosAccum) (str : Substring.Raw) : PosAccum := p.s str.toString
+/-- Emit the contents of a `Substring`, updating the current position.
+
+The characters are read out of the input where they are and pushed onto the
+output one by one, so a comment or a run of whitespace costs no copy of its
+text (`p.s str.toString`, which this replaced, built one). -/
+def sub (p : PosAccum) (str : Substring.Raw) : PosAccum :=
+  str.foldl (fun q ch =>
+    if ch = '\n' then { row := q.row + 1, col := 1, out := q.out.push ch }
+    else if ch = '\t' then { q with col := q.col + 8, out := q.out.push ch }
+    else { q with col := q.col + 1, out := q.out.push ch }) p
 
 /-- Pad with newlines/spaces so that the given target position is reached. -/
 def posn (p : PosAccum) : TokenPosn → PosAccum
   | { offset := _, line := ltgt, column := ctgt } =>
     let (bbline, ccur) :=
-      if p.row < ltgt then (String.ofList (List.replicate (ltgt - p.row) '\n'), 1) else ("", p.col)
-    let bbcol := if ccur < ctgt then String.ofList (List.replicate (ctgt - ccur) ' ') else ""
+      if p.row < ltgt then (String.pushn "" '\n' (ltgt - p.row), 1) else ("", p.col)
+    let bbcol := if ccur < ctgt then String.pushn "" ' ' (ctgt - ccur) else ""
     let lnew := if p.row < ltgt then ltgt else p.row
     let cnew := if ccur < ctgt then ctgt else ccur
     { row := lnew, col := cnew, out := p.out ++ bbline ++ bbcol }
@@ -81,6 +96,7 @@ def rBinOp (p : PosAccum) : JSBinOp → PosAccum
   | .JSBinOpMinus annot => (rAnnot p annot).s "-"
   | .JSBinOpMod annot => (rAnnot p annot).s "%"
   | .JSBinOpNeq annot => (rAnnot p annot).s "!="
+  | .JSBinOpNullish annot => (rAnnot p annot).s "??"
   | .JSBinOpOf annot => (rAnnot p annot).s "of"
   | .JSBinOpOr annot => (rAnnot p annot).s "||"
   | .JSBinOpPlus annot => (rAnnot p annot).s "+"
@@ -114,6 +130,9 @@ def rAssignOp (p : PosAccum) : JSAssignOp → PosAccum
   | .JSBwAndAssign annot => (rAnnot p annot).s "&="
   | .JSBwXorAssign annot => (rAnnot p annot).s "^="
   | .JSBwOrAssign annot => (rAnnot p annot).s "|="
+  | .JSLogicalAndAssign annot => (rAnnot p annot).s "&&="
+  | .JSLogicalOrAssign annot => (rAnnot p annot).s "||="
+  | .JSNullishAssign annot => (rAnnot p annot).s "??="
 
 def rSemi (p : PosAccum) : JSSemi → PosAccum
   | .JSSemi annot => (rAnnot p annot).s ";"
@@ -124,7 +143,7 @@ def rAccessor (p : PosAccum) : JSAccessor → PosAccum
   | .JSAccessorSet annot => (rAnnot p annot).s "set"
 
 def rIdent (p : PosAccum) : JSIdent → PosAccum
-  | .JSIdentName a str => (rAnnot p a).s str
+  | .JSIdentName a str => (rAnnot p a).s str.val
   | .JSIdentNone => p
 
 set_option maxHeartbeats 2000000 in
@@ -139,13 +158,11 @@ def rAST (p : PosAccum) : JSAST → PosAccum
 
 def rExpression (p : PosAccum) : JSExpression → PosAccum
   -- Terminals
-  | .JSIdentifier annot s => (rAnnot p annot).s s
-  | .JSDecimal annot i => (rAnnot p annot).s i
-  | .JSLiteral annot l => (rAnnot p annot).s l
-  | .JSHexInteger annot i => (rAnnot p annot).s i
-  | .JSOctal annot i => (rAnnot p annot).s i
-  | .JSStringLiteral annot s => (rAnnot p annot).s s
-  | .JSRegEx annot s => (rAnnot p annot).s s
+  | .JSIdentifier annot s => (rAnnot p annot).s s.val
+  | .JSNumberLit annot i => (rAnnot p annot).s i.render
+  | .JSLiteral annot l => (rAnnot p annot).s l.text.val
+  | .JSStringLiteral annot s => (rAnnot p annot).s s.render
+  | .JSRegEx annot s => (rAnnot p annot).s s.render
   -- Non terminals
   | .JSArrayLiteral als xs ars =>
       p |> (rAnnot · als) |> (·.s "[") |> (rArrayElements · xs) |> (rAnnot · ars) |> (·.s "]")
@@ -162,8 +179,9 @@ def rExpression (p : PosAccum) : JSExpression → PosAccum
   | .JSCallExpressionSquare ex als xs ars =>
       p |> (rExpression · ex) |> (rAnnot · als) |> (·.s "[") |> (rExpression · xs)
         |> (rAnnot · ars) |> (·.s "]")
-  | .JSClassExpression annot n h lb xs rb =>
-      p |> (rAnnot · annot) |> (·.s "class") |> (rIdent · n) |> (rClassHeritage · h)
+  | .JSClassExpression ds annot n h lb xs rb =>
+      p |> (rDecorators · ds) |> (rAnnot · annot) |> (·.s "class") |> (rIdent · n)
+        |> (rClassHeritage · h)
         |> (rAnnot · lb) |> (·.s "{") |> (rClassElements · xs) |> (rAnnot · rb) |> (·.s "}")
   | .JSCommaExpression le c re =>
       p |> (rExpression · le) |> (rAnnot · c) |> (·.s ",") |> (rExpression · re)
@@ -193,12 +211,31 @@ def rExpression (p : PosAccum) : JSExpression → PosAccum
   | .JSMemberSquare xs als e ars =>
       p |> (rExpression · xs) |> (rAnnot · als) |> (·.s "[") |> (rExpression · e)
         |> (rAnnot · ars) |> (·.s "]")
+  | .JSOptionalMemberDot xs q n =>
+      p |> (rExpression · xs) |> (rAnnot · q) |> (·.s "?.") |> (rExpression · n)
+  | .JSOptionalMemberSquare xs q als e ars =>
+      p |> (rExpression · xs) |> (rAnnot · q) |> (·.s "?.") |> (rAnnot · als) |> (·.s "[")
+        |> (rExpression · e) |> (rAnnot · ars) |> (·.s "]")
+  | .JSOptionalCallExpression ex q lb xs rb =>
+      p |> (rExpression · ex) |> (rAnnot · q) |> (·.s "?.") |> (rAnnot · lb) |> (·.s "(")
+        |> (rExprCommaList · xs) |> (rAnnot · rb) |> (·.s ")")
+  | .JSPrivateName annot s => (rAnnot p annot).s ("#" ++ s.val)
+  | .JSImportMeta a d m =>
+      p |> (rAnnot · a) |> (·.s "import") |> (rAnnot · d) |> (·.s ".") |> (rAnnot · m)
+        |> (·.s "meta")
+  | .JSNewTarget a d m =>
+      p |> (rAnnot · a) |> (·.s "new") |> (rAnnot · d) |> (·.s ".") |> (rAnnot · m)
+        |> (·.s "target")
+  | .JSImportCall a lb xs rb =>
+      p |> (rAnnot · a) |> (·.s "import") |> (rAnnot · lb) |> (·.s "(")
+        |> (rExprCommaList · xs) |> (rAnnot · rb) |> (·.s ")")
   | .JSNewExpression n e => p |> (rAnnot · n) |> (·.s "new") |> (rExpression · e)
   | .JSObjectLiteral alb xs arb =>
       p |> (rAnnot · alb) |> (·.s "{") |> (rObjectPropertyList · xs) |> (rAnnot · arb)
         |> (·.s "}")
   | .JSTemplateLiteral t a h ps =>
-      p |> (rMaybeExpression · t) |> (rAnnot · a) |> (·.s h) |> (rTemplateParts · ps)
+      p |> (rMaybeExpression · t) |> (rAnnot · a) |> (·.s (templateHeadSpelling h ps))
+        |> (rTemplateParts · ps)
   | .JSUnaryExpression op x => p |> (rUnaryOp · op) |> (rExpression · x)
   | .JSVarInitExpression x1 x2 => p |> (rExpression · x1) |> (rVarInitializer · x2)
   | .JSYieldExpression y x => p |> (rAnnot · y) |> (·.s "yield") |> (rMaybeExpression · x)
@@ -217,14 +254,20 @@ def rStatement (p : PosAccum) : JSStatement → PosAccum
         |> (rSemi · s)
   | .JSBreak annot mi s =>
       p |> (rAnnot · annot) |> (·.s "break") |> (rIdent · mi) |> (rSemi · s)
-  | .JSClass annot n h lb xs rb s =>
-      p |> (rAnnot · annot) |> (·.s "class") |> (rIdent · n) |> (rClassHeritage · h)
+  | .JSClass ds annot n h lb xs rb s =>
+      p |> (rDecorators · ds) |> (rAnnot · annot) |> (·.s "class") |> (rIdent · n)
+        |> (rClassHeritage · h)
         |> (rAnnot · lb) |> (·.s "{") |> (rClassElements · xs) |> (rAnnot · rb) |> (·.s "}")
         |> (rSemi · s)
   | .JSContinue annot mi s =>
       p |> (rAnnot · annot) |> (·.s "continue") |> (rIdent · mi) |> (rSemi · s)
   | .JSConstant annot xs s =>
-      p |> (rAnnot · annot) |> (·.s "const") |> (rExprCommaList · xs) |> (rSemi · s)
+      p |> (rAnnot · annot) |> (·.s "const") |> (rExprCommaList1 · xs) |> (rSemi · s)
+  | .JSUsing annot xs s =>
+      p |> (rAnnot · annot) |> (·.s "using") |> (rExprCommaList1 · xs) |> (rSemi · s)
+  | .JSAwaitUsing aw annot xs s =>
+      p |> (rAnnot · aw) |> (·.s "await") |> (rAnnot · annot) |> (·.s "using")
+        |> (rExprCommaList1 · xs) |> (rSemi · s)
   | .JSDoWhile ad x1 aw alb x2 arb x3 =>
       p |> (rAnnot · ad) |> (·.s "do") |> (rStatement · x1) |> (rAnnot · aw) |> (·.s "while")
         |> (rAnnot · alb) |> (·.s "(") |> (rExpression · x2) |> (rAnnot · arb) |> (·.s ")")
@@ -239,7 +282,7 @@ def rStatement (p : PosAccum) : JSStatement → PosAccum
         |> (rBinOp · i) |> (rExpression · x2) |> (rAnnot · arb) |> (·.s ")") |> (rStatement · x3)
   | .JSForVar af alb v x1s s1 x2s s2 x3s arb x4 =>
       p |> (rAnnot · af) |> (·.s "for") |> (rAnnot · alb) |> (·.s "(") |> (·.s "var")
-        |> (rAnnot · v) |> (rExprCommaList · x1s) |> (rAnnot · s1) |> (·.s ";")
+        |> (rAnnot · v) |> (rExprCommaList1 · x1s) |> (rAnnot · s1) |> (·.s ";")
         |> (rExprCommaList · x2s) |> (rAnnot · s2) |> (·.s ";") |> (rExprCommaList · x3s)
         |> (rAnnot · arb) |> (·.s ")") |> (rStatement · x4)
   | .JSForVarIn af alb v x1 i x2 arb x3 =>
@@ -248,7 +291,7 @@ def rStatement (p : PosAccum) : JSStatement → PosAccum
         |> (rAnnot · arb) |> (·.s ")") |> (rStatement · x3)
   | .JSForLet af alb v x1s s1 x2s s2 x3s arb x4 =>
       p |> (rAnnot · af) |> (·.s "for") |> (rAnnot · alb) |> (·.s "(") |> (·.s "let")
-        |> (rAnnot · v) |> (rExprCommaList · x1s) |> (rAnnot · s1) |> (·.s ";")
+        |> (rAnnot · v) |> (rExprCommaList1 · x1s) |> (rAnnot · s1) |> (·.s ";")
         |> (rExprCommaList · x2s) |> (rAnnot · s2) |> (·.s ";") |> (rExprCommaList · x3s)
         |> (rAnnot · arb) |> (·.s ")") |> (rStatement · x4)
   | .JSForLetIn af alb v x1 i x2 arb x3 =>
@@ -261,7 +304,7 @@ def rStatement (p : PosAccum) : JSStatement → PosAccum
         |> (rAnnot · arb) |> (·.s ")") |> (rStatement · x3)
   | .JSForConst af alb v x1s s1 x2s s2 x3s arb x4 =>
       p |> (rAnnot · af) |> (·.s "for") |> (rAnnot · alb) |> (·.s "(") |> (·.s "const")
-        |> (rAnnot · v) |> (rExprCommaList · x1s) |> (rAnnot · s1) |> (·.s ";")
+        |> (rAnnot · v) |> (rExprCommaList1 · x1s) |> (rAnnot · s1) |> (·.s ";")
         |> (rExprCommaList · x2s) |> (rAnnot · s2) |> (·.s ";") |> (rExprCommaList · x3s)
         |> (rAnnot · arb) |> (·.s ")") |> (rStatement · x4)
   | .JSForConstIn af alb v x1 i x2 arb x3 =>
@@ -299,7 +342,7 @@ def rStatement (p : PosAccum) : JSStatement → PosAccum
         |> (rStatement · x3s)
   | .JSLabelled l c v => p |> (rIdent · l) |> (rAnnot · c) |> (·.s ":") |> (rStatement · v)
   | .JSLet annot xs s =>
-      p |> (rAnnot · annot) |> (·.s "let") |> (rExprCommaList · xs) |> (rSemi · s)
+      p |> (rAnnot · annot) |> (·.s "let") |> (rExprCommaList1 · xs) |> (rSemi · s)
   | .JSExpressionStatement l s => p |> (rExpression · l) |> (rSemi · s)
   | .JSAssignStatement lhs op rhs s =>
       p |> (rExpression · lhs) |> (rAssignOp · op) |> (rExpression · rhs) |> (rSemi · s)
@@ -318,7 +361,7 @@ def rStatement (p : PosAccum) : JSStatement → PosAccum
       p |> (rAnnot · annot) |> (·.s "try") |> (rBlock · tb) |> (rTryCatches · tcs)
         |> (rTryFinally · tf)
   | .JSVariable annot xs s =>
-      p |> (rAnnot · annot) |> (·.s "var") |> (rExprCommaList · xs) |> (rSemi · s)
+      p |> (rAnnot · annot) |> (·.s "var") |> (rExprCommaList1 · xs) |> (rSemi · s)
   | .JSWhile annot alp x1 arp x2 =>
       p |> (rAnnot · annot) |> (·.s "while") |> (rAnnot · alp) |> (·.s "(")
         |> (rExpression · x1) |> (rAnnot · arp) |> (·.s ")") |> (rStatement · x2)
@@ -360,7 +403,8 @@ def rModuleItem (p : PosAccum) : JSModuleItem → PosAccum
 def rImportDeclaration (p : PosAccum) : JSImportDeclaration → PosAccum
   | .JSImportDeclaration imp from_ annot =>
       p |> (rImportClause · imp) |> (rFromClause · from_) |> (rSemi · annot)
-  | .JSImportDeclarationBare annot m s => p |> (rAnnot · annot) |> (·.s m) |> (rSemi · s)
+  | .JSImportDeclarationBare annot m attrs s =>
+      p |> (rAnnot · annot) |> (·.s m.val) |> (rImportAttributes? · attrs) |> (rSemi · s)
 
 def rImportClause (p : PosAccum) : JSImportClause → PosAccum
   | .JSImportClauseDefault x => rIdent p x
@@ -372,8 +416,29 @@ def rImportClause (p : PosAccum) : JSImportClause → PosAccum
       p |> (rIdent · x1) |> (rAnnot · annot) |> (·.s ",") |> (rImportsNamed · x2)
 
 def rFromClause (p : PosAccum) : JSFromClause → PosAccum
-  | .JSFromClause from_ annot m =>
-      p |> (rAnnot · from_) |> (·.s "from") |> (rAnnot · annot) |> (·.s m)
+  | .JSFromClause from_ annot m attrs =>
+      p |> (rAnnot · from_) |> (·.s "from") |> (rAnnot · annot) |> (·.s m.val)
+        |> (rImportAttributes? · attrs)
+
+def rImportAttribute (p : PosAccum) : JSImportAttribute → PosAccum
+  | .JSImportAttribute ka k colon va v =>
+      p |> (rAnnot · ka) |> (·.s k.val) |> (rAnnot · colon) |> (·.s ":") |> (rAnnot · va)
+        |> (·.s v.val)
+
+def rImportAttrCommaList (p : PosAccum) : JSCommaList JSImportAttribute → PosAccum
+  | .JSLCons xs a x =>
+      p |> (rImportAttrCommaList · xs) |> (rAnnot · a) |> (·.s ",") |> (rImportAttribute · x)
+  | .JSLOne x => rImportAttribute p x
+  | .JSLNil => p
+
+def rImportAttributes (p : PosAccum) : JSImportAttributes → PosAccum
+  | .JSImportAttributes w lb attrs rb =>
+      p |> (rAnnot · w) |> (·.s "with") |> (rAnnot · lb) |> (·.s "{")
+        |> (rImportAttrCommaList · attrs) |> (rAnnot · rb) |> (·.s "}")
+
+def rImportAttributes? (p : PosAccum) : Option JSImportAttributes → PosAccum
+  | none => p
+  | some a => rImportAttributes p a
 
 def rImportNameSpace (p : PosAccum) : JSImportNameSpace → PosAccum
   | .JSImportNameSpace star annot x =>
@@ -394,6 +459,13 @@ def rExportDeclaration (p : PosAccum) : JSExportDeclaration → PosAccum
   | .JSExportLocals xs semi => p |> (rExportClause · xs) |> (rSemi · semi)
   | .JSExportFrom xs from_ semi =>
       p |> (rExportClause · xs) |> (rFromClause · from_) |> (rSemi · semi)
+  | .JSExportAll star from_ semi =>
+      p |> (rAnnot · star) |> (·.s "*") |> (rFromClause · from_) |> (rSemi · semi)
+  | .JSExportAllAs star asA n from_ semi =>
+      p |> (rAnnot · star) |> (·.s "*") |> (rAnnot · asA) |> (·.s "as") |> (rIdent · n)
+        |> (rFromClause · from_) |> (rSemi · semi)
+  | .JSExportDefault d e semi =>
+      p |> (rAnnot · d) |> (·.s "default") |> (rExpression · e) |> (rSemi · semi)
 
 def rExportClause (p : PosAccum) : JSExportClause → PosAccum
   | .JSExportClause alb s arb =>
@@ -406,9 +478,12 @@ def rExportSpecifier (p : PosAccum) : JSExportSpecifier → PosAccum
       p |> (rIdent · x1) |> (rAnnot · annot) |> (·.s "as") |> (rIdent · x2)
 
 def rObjectProperty (p : PosAccum) : JSObjectProperty → PosAccum
-  | .JSPropertyNameandValue n c vs =>
-      p |> (rPropertyName · n) |> (rAnnot · c) |> (·.s ":") |> (rExpressions · vs)
-  | .JSPropertyIdentRef a s => (rAnnot p a).s s
+  | .JSPropertyNameandValue n c v =>
+      p |> (rPropertyName · n) |> (rAnnot · c) |> (·.s ":") |> (rExpression · v)
+  | .JSPropertyIdentRef a s => (rAnnot p a).s s.val
+  | .JSPropertyIdentRefDefault a s eq v =>
+      p |> (rAnnot · a) |> (·.s s.val) |> (rAnnot · eq) |> (·.s "=") |> (rExpression · v)
+  | .JSObjectSpread a e => p |> (rAnnot · a) |> (·.s "...") |> (rExpression · e)
   | .JSObjectMethod m => rMethodDefinition p m
 
 def rMethodDefinition (p : PosAccum) : JSMethodDefinition → PosAccum
@@ -423,9 +498,10 @@ def rMethodDefinition (p : PosAccum) : JSMethodDefinition → PosAccum
         |> (rExprCommaList · ps) |> (rAnnot · arp) |> (·.s ")") |> (rBlock · b)
 
 def rPropertyName (p : PosAccum) : JSPropertyName → PosAccum
-  | .JSPropertyIdent a s => (rAnnot p a).s s
-  | .JSPropertyString a s => (rAnnot p a).s s
-  | .JSPropertyNumber a s => (rAnnot p a).s s
+  | .JSPropertyIdent a s => (rAnnot p a).s s.val
+  | .JSPropertyPrivate a s => (rAnnot p a).s ("#" ++ s.val)
+  | .JSPropertyString a s => (rAnnot p a).s s.render
+  | .JSPropertyNumber a s => (rAnnot p a).s s.render
   | .JSPropertyComputed lb x rb =>
       p |> (rAnnot · lb) |> (·.s "[") |> (rExpression · x) |> (rAnnot · rb) |> (·.s "]")
 
@@ -433,17 +509,35 @@ def rArrayElement (p : PosAccum) : JSArrayElement → PosAccum
   | .JSArrayElement e => rExpression p e
   | .JSArrayComma a => p |> (rAnnot · a) |> (·.s ",")
 
-def rTemplatePart (p : PosAccum) : JSTemplatePart → PosAccum
-  | .JSTemplatePart e a s => p |> (rExpression · e) |> (rAnnot · a) |> (·.s s)
+/-- A part of a template literal: the substitution, then the text which
+follows it, between the `}` which closes the substitution and either the
+`${` of the next one or, for the last part, the closing backquote. -/
+def rTemplatePart (p : PosAccum) (isLast : Bool) : JSTemplatePart → PosAccum
+  | .JSTemplatePart e a s =>
+      p |> (rExpression · e) |> (rAnnot · a) |> (·.s (templatePartSpelling s isLast))
 
 def rClassHeritage (p : PosAccum) : JSClassHeritage → PosAccum
   | .JSExtends a e => p |> (rAnnot · a) |> (·.s "extends") |> (rExpression · e)
   | .JSExtendsNone => p
 
 def rClassElement (p : PosAccum) : JSClassElement → PosAccum
-  | .JSClassInstanceMethod m => rMethodDefinition p m
-  | .JSClassStaticMethod a m => p |> (rAnnot · a) |> (·.s "static") |> (rMethodDefinition · m)
+  | .JSClassInstanceMethod ds m => p |> (rDecorators · ds) |> (rMethodDefinition · m)
+  | .JSClassStaticMethod ds a m =>
+      p |> (rDecorators · ds) |> (rAnnot · a) |> (·.s "static") |> (rMethodDefinition · m)
+  | .JSClassInstanceField ds n i s =>
+      p |> (rDecorators · ds) |> (rPropertyName · n) |> (rVarInitializer · i) |> (rSemi · s)
+  | .JSClassStaticField ds a n i s =>
+      p |> (rDecorators · ds) |> (rAnnot · a) |> (·.s "static") |> (rPropertyName · n)
+        |> (rVarInitializer · i) |> (rSemi · s)
+  | .JSClassStaticBlock a b => p |> (rAnnot · a) |> (·.s "static") |> (rBlock · b)
   | .JSClassSemi a => p |> (rAnnot · a) |> (·.s ";")
+
+def rDecorator (p : PosAccum) : JSDecorator → PosAccum
+  | .JSDecorator a e => p |> (rAnnot · a) |> (·.s "@") |> (rExpression · e)
+
+def rDecorators (p : PosAccum) : List JSDecorator → PosAccum
+  | [] => p
+  | d :: ds => rDecorators (rDecorator p d) ds
 
 def rVarInitializer (p : PosAccum) : JSVarInitializer → PosAccum
   | .JSVarInit a x => p |> (rAnnot · a) |> (·.s "=") |> (rExpression · x)
@@ -485,13 +579,21 @@ def rClassElements (p : PosAccum) : List JSClassElement → PosAccum
 
 def rTemplateParts (p : PosAccum) : List JSTemplatePart → PosAccum
   | [] => p
-  | x :: xs => rTemplateParts (rTemplatePart p x) xs
+  | [x] => rTemplatePart p true x
+  | x :: xs => rTemplateParts (rTemplatePart p false x) xs
 
 def rExprCommaList (p : PosAccum) : JSCommaList JSExpression → PosAccum
   | .JSLCons pl a i =>
       p |> (rExprCommaList · pl) |> (rAnnot · a) |> (·.s ",") |> (rExpression · i)
   | .JSLOne i => rExpression p i
   | .JSLNil => p
+
+/-- The declarators of a `var`, `let` or `const`, which are a non-empty
+comma list. -/
+def rExprCommaList1 (p : PosAccum) : JSCommaList1 JSExpression → PosAccum
+  | .JSL1Cons pl a i =>
+      p |> (rExprCommaList1 · pl) |> (rAnnot · a) |> (·.s ",") |> (rExpression · i)
+  | .JSL1One i => rExpression p i
 
 def rImportSpecCommaList (p : PosAccum) : JSCommaList JSImportSpecifier → PosAccum
   | .JSLCons pl a i =>
@@ -524,4 +626,4 @@ def renderJS (node : JSAST) : String :=
 /-- Render an AST back to JavaScript source. -/
 def renderToString (js : JSAST) : String := renderJS js
 
-end LanguageJavaScript.Pretty
+end Language.JavaScript.Pretty

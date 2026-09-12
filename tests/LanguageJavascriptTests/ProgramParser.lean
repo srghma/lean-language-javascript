@@ -4,13 +4,14 @@ Port of the Haskell test module `ProgramParser`.
 import Spec
 import LanguageJavascript.Parser
 import LanguageJavascript.AST
+import LanguageJavascript.ShowStripped
 
 namespace LanguageJavascriptTests.ProgramParser
 
 open Spec
 open Spec.Assert
-open LanguageJavaScript.Parser
-open LanguageJavaScript.Parser.AST
+open Language.JavaScript.Parser
+open Language.JavaScript.Parser.AST
 
 def escapeLabel (s : String) : String :=
   s.replace "\n" "\\n" |>.replace "\r" "\\r"
@@ -74,8 +75,8 @@ def programCases : List (String × String) :=
   , ("x=\"abc\\x2028 def\";", "Right (JSAstProgram [JSOpAssign ('=',JSIdentifier 'x',JSStringLiteral \"abc\\x2028 def\"),JSSemicolon])")
   , ("x=\"abc\\x2029 def\";", "Right (JSAstProgram [JSOpAssign ('=',JSIdentifier 'x',JSStringLiteral \"abc\\x2029 def\"),JSSemicolon])")
   -- object literal
-  , ("x = { y: 1e8 }", "Right (JSAstProgram [JSOpAssign ('=',JSIdentifier 'x',JSObjectLiteral [JSPropertyNameandValue (JSIdentifier 'y') [JSDecimal '1e8']])])")
-  , ("{ y: 1e8 }", "Right (JSAstProgram [JSStatementBlock [JSLabelled (JSIdentifier 'y') (JSDecimal '1e8')]])")
+  , ("x = { y: 1e8 }", "Right (JSAstProgram [JSOpAssign ('=',JSIdentifier 'x',JSObjectLiteral [JSPropertyNameandValue (JSIdentifier 'y') [JSDecimal '100000000']])])")
+  , ("{ y: 1e8 }", "Right (JSAstProgram [JSStatementBlock [JSLabelled (JSIdentifier 'y') (JSDecimal '100000000')]])")
   , ("{ y: 18 }", "Right (JSAstProgram [JSStatementBlock [JSLabelled (JSIdentifier 'y') (JSDecimal '18')]])")
   , ("x = { y: 18 }", "Right (JSAstProgram [JSOpAssign ('=',JSIdentifier 'x',JSObjectLiteral [JSPropertyNameandValue (JSIdentifier 'y') [JSDecimal '18']])])")
   , ("var k = {\ny: somename\n}", "Right (JSAstProgram [JSVariable (JSVarInitExpression (JSIdentifier 'k') [JSObjectLiteral [JSPropertyNameandValue (JSIdentifier 'y') [JSIdentifier 'somename']]])])")

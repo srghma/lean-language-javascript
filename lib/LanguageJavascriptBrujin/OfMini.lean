@@ -6,6 +6,12 @@ import LanguageJavascriptMini.OfFull
 
 namespace Language.JavaScript.BrujinAST
 
+-- The set of unknown globals a tree may mention: the conversion builds a
+-- tree whose extension is `GlobalExt g`, the escape hatch being a name it
+-- does not bind.  Every function here is generic in the set: none of them
+-- invents a global, and none of them needs to know which ones there are.
+variable {g : Finset NEString}
+
 open Language.JavaScript.MiniAST
 
 structure Binding where
@@ -29,11 +35,35 @@ def pushMuts (env : Env) (m : Nat) (names : List NEString) : Env :=
 
 end Env
 
-abbrev ConvM := Except String
+/-- The result of the conversion.  It carries a set of names as state: the
+unknown globals the source mentions which are *not* in the target `g`.
 
-def fail (msg : String) : ConvM α := .error ("BrujinAST: " ++ msg)
+That is what makes the conversion possible at all.  A `BrujinAST` tree is
+indexed by the set of unknown globals it may mention, so the set has to be
+known before the tree is built; a first pass against the empty set records
+every free name it meets and puts a placeholder in the tree, and the second
+pass, run against the set the first one collected, builds the real tree and
+records nothing. -/
+abbrev ConvM := StateT (Finset NEString) (Except String)
 
-def resolveVar (env : Env) (c m : Nat) (n : NEString) : ConvM (Expr c m) :=
+/-- The result of a conversion which is not allowed to fail on a global. -/
+abbrev ResM := Except String
+
+def fail (msg : String) : ConvM α := throw ("BrujinAST: " ++ msg)
+
+/-- A name the tree does not bind: the escape hatch, which needs `n` to be
+one of the globals `g`.  When it is not, the name is recorded and a
+placeholder is returned — see `ConvM`. -/
+def freeName (n : NEString) : ConvM (Global.Expr c m g) :=
+  if h : n ∈ g then pure (.unsafeGlobal n h)
+  else do modify (insert n); pure .null
+
+/-- The same, for the left hand side of an assignment. -/
+def freeTarget (n : NEString) : ConvM (Global.Target c m g) :=
+  if h : n ∈ g then pure (.unsafeGlobal n h)
+  else do modify (insert n); pure (.dot .null n)
+
+def resolveVar (env : Env) (c m : Nat) (n : NEString) : ConvM (Global.Expr c m g) :=
   match idxIdent? n with
   | some (true, i) =>
       if h : i < c then pure (.constVar ⟨i, h⟩)
@@ -43,18 +73,18 @@ def resolveVar (env : Env) (c m : Nat) (n : NEString) : ConvM (Expr c m) :=
       else fail s!"the de Bruijn index l#{i} is out of range: {m} mutable bindings are in scope"
   | none =>
     match env.lookup n with
-    | none => pure (.unsafeGlobal n)
+    | none => freeName n
     | some b =>
         if b.isConst then
           match constIndex? c b.level with
           | some i => pure (.constVar i)
-          | none => pure (.unsafeGlobal n)
+          | none => freeName n
         else
           match mutIndex? m b.level with
           | some i => pure (.mutVar i)
-          | none => pure (.unsafeGlobal n)
+          | none => freeName n
 
-def resolveTarget (env : Env) (c m : Nat) (n : NEString) : ConvM (Target c m) :=
+def resolveTarget (env : Env) (c m : Nat) (n : NEString) : ConvM (Global.Target c m g) :=
   match idxIdent? n with
   | some (true, i) => fail s!"assignment to the const variable c#{i}"
   | some (false, i) =>
@@ -62,17 +92,17 @@ def resolveTarget (env : Env) (c m : Nat) (n : NEString) : ConvM (Target c m) :=
       else fail s!"the de Bruijn index l#{i} is out of range: {m} mutable bindings are in scope"
   | none =>
     match env.lookup n with
-    | none => pure (.unsafeGlobal n)
+    | none => freeTarget n
     | some b =>
         if b.isConst then
           fail s!"assignment to the const variable {n.val}"
         else
           match mutIndex? m b.level with
           | some i => pure (.mut i)
-          | none => pure (.unsafeGlobal n)
+          | none => freeTarget n
 
 def resolveExportLocal (env : Env) (c m : Nat) (n exported : NEString) :
-    ConvM (ExportLocal c m) :=
+    ConvM (Global.ExportLocal c m g) :=
   match idxIdent? n with
   | some (true, i) =>
       if h : i < c then pure (.const ⟨i, h⟩ exported)
@@ -93,56 +123,170 @@ def resolveExportLocal (env : Env) (c m : Nat) (n exported : NEString) :
           | some i => pure (.mut i exported)
           | none => fail s!"export of the out of scope name {n.val}"
 
-def binderName : MiniExpr → ConvM NEString
+/-- The name a binding pattern binds.  `BrujinAST` has a binder for a plain
+name only, so a destructuring pattern and a default value are refused. -/
+def binderName : MiniPattern → ConvM NEString
   | .ident n => pure n
-  | .array _ | .object _ => fail "a destructuring pattern in a binder"
-  | .assign _ _ _ => fail "a default value in a binder"
-  | _ => fail "a binder that is not a name"
+  | .array _ | .object _ _ => fail "a destructuring pattern in a binder"
+  | .withDefault _ _ => fail "a default value in a binder"
+  | .target _ => fail "a binder that is not a name"
 
-def paramNamesOf (params : List MiniExpr) : ConvM (List NEString) :=
-  params.mapM binderName
+/-- The name a parameter binds.  `BrujinAST` has a binder for a plain name
+only, so a default value and a destructuring pattern are refused; a rest
+parameter binds a name like any other, and the tree records that it is one.
+-/
+def paramBinderName : MiniParam → ConvM NEString
+  | .plain p | .rest p =>
+    match p with
+    | .ident n => pure n
+    | .array _ | .object _ _ => fail "a destructuring pattern in a parameter"
+    | .withDefault _ _ => fail "a default value in a parameter"
+    | .target _ => fail "a parameter that is not a name"
 
-def splitDecl : MiniStatement → List MiniStatement
-  | .empty => []
-  | .decl kind decls => decls.toList.map fun d => .decl kind ⟨d, []⟩
-  | s => [s]
+/-- The parameters of a function: the names they bind, in source order,
+together with how the tree records them — `arity` ordinary parameters
+followed by a rest parameter if `hasRest`. -/
+structure ParamsRes where
+  /-- The name each parameter binds, the rest parameter included. -/
+  names : List NEString
+  /-- The number of ordinary parameters. -/
+  arity : Nat
+  /-- Whether a rest parameter follows them. -/
+  hasRest : Bool
+  /-- One name is bound per parameter. -/
+  len : names.length = arity + hasRest.toNat
 
-def expandStmts (l : List MiniStatement) : List MiniStatement := l.flatMap splitDecl
+/-- Whether a parameter is a rest parameter. -/
+def isRestParam : MiniParam → Bool
+  | .rest _ => true
+  | _ => false
 
-def expandItems (items : List MiniModuleItem) : List MiniModuleItem :=
-  items.flatMap fun
-    | .stmt s => (splitDecl s).map .stmt
-    | .exportDecl (.decl s) => (splitDecl s).map fun s => .exportDecl (.decl s)
-    | it => [it]
+/-- Read the parameters of a function.  A rest parameter is accepted where
+JavaScript allows one, which is nowhere but last. -/
+def paramsOf (params : List MiniParam) : ConvM ParamsRes := do
+  if params.dropLast.any isRestParam then
+    fail "a rest parameter which is not the last one"
+  else
+    let v : Vector MiniParam params.length := ⟨params.toArray, by simp⟩
+    let names ← v.mapM paramBinderName
+    match hp : params.getLast? with
+    | some (.rest _) =>
+        have h0 : 0 < params.length := by
+          cases params with
+          | nil => simp at hp
+          | cons _ t => simp
+        pure ⟨names.toList, params.length - 1, true, by simp; omega⟩
+    | _ => pure ⟨names.toList, params.length, false, by simp⟩
 
-structure StmtRes (c m : Nat) where
+structure StmtRes (c m : Nat) (g : Finset NEString) where
   dc : Nat
   dm : Nat
-  stmt : Stmt c m dc dm
+  stmt : Global.Stmt c m g dc dm
   binds : List Binding
 
-structure ItemRes (c m : Nat) where
+structure ItemRes (c m : Nat) (g : Finset NEString) where
   dc : Nat
   dm : Nat
-  item : ModuleItem c m dc dm
+  item : Global.ModuleItem c m g dc dm
   binds : List Binding
+
+/-! ## Putting a declarator in front of what follows it
+
+A `var`/`let`/`const` statement with several declarators becomes one
+`BrujinAST` statement per declarator, since each of them binds.  This used
+to be done by rewriting the *list* of statements before converting it,
+which is what cost this module its structural recursion: the rewritten list
+is not a component of anything, so the conversion of a block could not be
+seen to recurse on the block.
+
+It is now done in place, by `ofDeclThenBlock` (and `ofDeclThenItems` for the
+top level), which converts one declarator and
+then calls the continuation it is given for whatever follows it — the part
+of the program that sees the new binding.  What the declarator and the
+continuation produce is put together by the two functions below, which is
+all that differs between the three places a declaration can occur: inside a
+block, at the top level, and after an `export`. -/
+
+/-- What a declarator declares: a `var`, a `let` or a `const`, or a
+`using`/`await using`.  A `using` binding cannot be assigned to, so — like
+a `const` — it is a const binding. -/
+inductive DeclKind where
+  /-- `var`, `let` or `const`. -/
+  | var_ (kind : VarKind)
+  /-- `using` (`isAwait = false`) or `await using`. -/
+  | using_ (isAwait : Bool)
+deriving Repr, Inhabited
+
+/-- A `const` declarator in front of the rest of a block. -/
+def blockConsConst (c m : Nat) (init : Global.Expr c m g) (tl : Global.Block (c + 1) m g) : Global.Block c m g :=
+  .cons (.constDecl init) tl
+
+/-- A `using` declarator in front of the rest of a block. -/
+def blockConsUsing (c m : Nat) (isAwait : Bool) (init : Global.Expr c m g)
+    (tl : Global.Block (c + 1) m g) : Global.Block c m g :=
+  .cons (.usingDecl isAwait init) tl
+
+/-- A `let`/`var` declarator in front of the rest of a block. -/
+def blockConsLet (c m : Nat) (init : Global.OptExpr c m g) (tl : Global.Block c (m + 1) g) : Global.Block c m g :=
+  .cons (.letDecl init) tl
+
+/-- A `const` declarator in front of the rest of the top level; `exported`
+says whether it is written after an `export`. -/
+def itemsConsConst (exported : Bool) (c m : Nat) (init : Global.Expr c m g)
+    (tl : Global.ModuleItems (c + 1) m g) : Global.ModuleItems c m g :=
+  if exported then .cons (.exportDecl (.constDecl init)) tl
+  else .cons (.stmt (.constDecl init)) tl
+
+/-- A `using` declarator in front of the rest of the top level. -/
+def itemsConsUsing (exported : Bool) (isAwait : Bool) (c m : Nat) (init : Global.Expr c m g)
+    (tl : Global.ModuleItems (c + 1) m g) : Global.ModuleItems c m g :=
+  if exported then .cons (.exportDecl (.usingDecl isAwait init)) tl
+  else .cons (.stmt (.usingDecl isAwait init)) tl
+
+/-- A `let`/`var` declarator in front of the rest of the top level. -/
+def itemsConsLet (exported : Bool) (c m : Nat) (init : Global.OptExpr c m g)
+    (tl : Global.ModuleItems c (m + 1) g) : Global.ModuleItems c m g :=
+  if exported then .cons (.exportDecl (.letDecl init)) tl
+  else .cons (.stmt (.letDecl init)) tl
+
+/-! ## The conversion
+
+Every function below recurses on a component of its argument, so the block
+is *structurally* recursive: it has equations, it reduces in the kernel and
+it can be reasoned about, rather than being `partial` and opaque.
+
+Three things had to be arranged for that.  Every `mapM` of a conversion is
+spelled out as a function of the same block, walking the list it is given.
+A declaration of several variables is converted in place (`ofDeclThenBlock`
+above) rather than by rewriting the statement list first.  And the body of
+an `if`, a loop or a `for`, which is a *statement* where a block is wanted,
+is converted by `ofBody`, which takes the conversion of that statement as
+its last argument: the caller has it as a component of the node it is
+looking at, so passing it keeps every recursive call on a component. -/
 
 mutual
 
-partial def ofExpr (env : Env) (c m : Nat) (e : MiniExpr) : ConvM (Expr c m) := do
+/-- Convert an expression. -/
+def ofExpr (env : Env) (c m : Nat) (e : MiniExpr) : ConvM (Global.Expr c m g) := do
   match e with
   | .ident n => resolveVar env c m n
-  | .number raw => pure (.number raw)
+  | .number n => pure (.number n)
   | .string v => pure (.string v)
-  | .regex raw => pure (.regex raw)
+  | .regex r => pure (.regex r)
   | .null => pure .null
   | .true_ => pure .true_
   | .false_ => pure .false_
   | .this => pure .this
-  | .array els => pure (.array (ArrayElems.ofList (← els.mapM (ofArrayElem env c m))))
-  | .object ps => pure (.object (Properties.ofList (← ps.mapM (ofProperty env c m))))
+  | .superDot n => pure (.superDot n)
+  | .superIndex i => pure (.superIndex (← ofExpr env c m i))
+  | .superCall args => pure (.superCall (← ofExprs env c m args))
+  | .newTarget => pure .newTarget
+  | .array els => pure (.array (← ofArrayElems env c m els))
+  | .object ps => pure (.object (← ofProperties env c m ps))
   | .assign lhs op rhs =>
       pure (.assign (← ofTarget env c m lhs) op (← ofExpr env c m rhs))
+  | .assignPattern lhs rhs =>
+      pure (.assign (← ofPatternTarget env c m lhs) .assign (← ofExpr env c m rhs))
   | .postfix x op => pure (.update (← ofTarget env c m x) op false)
   | .unary op x =>
       match op with
@@ -150,240 +294,483 @@ partial def ofExpr (env : Env) (c m : Nat) (e : MiniExpr) : ConvM (Expr c m) := 
       | .preDecr => pure (.update (← ofTarget env c m x) .decr true)
       | _ => pure (.unary op (← ofExpr env c m x))
   | .await x => pure (.await (← ofExpr env c m x))
-  | .call f args => pure (.call (← ofExpr env c m f) (Exprs.ofList (← args.mapM (ofExpr env c m))))
-  | .new f args => pure (.new (← ofExpr env c m f) (Exprs.ofList (← args.mapM (ofExpr env c m))))
+  | .call f args => pure (.call (← ofExpr env c m f) (← ofExprs env c m args))
+  | .new f args => pure (.new (← ofExpr env c m f) (← ofExprs env c m args))
   | .dot o n => pure (.dot (← ofExpr env c m o) n)
   | .index o i => pure (.index (← ofExpr env c m o) (← ofExpr env c m i))
-  | .classExpr name heritage body =>
+  | .privateDot o n => pure (.privateDot (← ofExpr env c m o) n)
+  | .privateName n => pure (.privateName n)
+  | .chain base links =>
+      pure (.chain (← ofExpr env c m base) (← ofChainLink env c m links.hd)
+        (← ofChainLinks env c m links.tl))
+  | .importMeta => pure .importMeta
+  | .importCall spec opts =>
+      pure (.importCall (← ofExpr env c m spec) (← ofOptExpr env c m opts))
+  | .classExpr decorators name heritage body =>
+      -- the decorators are evaluated outside the class, so they do not see
+      -- the name the class binds in its own body
+      let ds ← ofExprs env c m decorators
       let her ← ofOptExpr env c m heritage
       match name with
-      | none => pure (.classAnon her (← ofClassElems env c m body))
+      | none => pure (.classAnon ds her (← ofClassElems env c m body))
       | some n =>
-          pure (.classSelf her (← ofClassElems (env.pushConsts c [n]) (c + 1) m body))
+          pure (.classSelf ds her (← ofClassElems (env.pushConsts c [n]) (c + 1) m body))
   | .seq a b => pure (.seq (← ofExpr env c m a) (← ofExpr env c m b))
   | .binary a op b => pure (.binary (← ofExpr env c m a) op (← ofExpr env c m b))
   | .ternary a b d =>
       pure (.ternary (← ofExpr env c m a) (← ofExpr env c m b) (← ofExpr env c m d))
   | .arrow params body =>
-      let ps ← paramNamesOf params
-      let inner := env.pushMuts m ps
+      let ps ← paramsOf params
+      let inner := env.pushMuts m ps.names
       match body with
-      | .expr x => pure (.arrow ps.length (.expr (← ofExpr inner c (m + ps.length) x)))
-      | .block b => pure (.arrow ps.length (.block (← ofBlock inner c (m + ps.length) b)))
+      | .expr x =>
+          pure (.arrow ps.arity ps.hasRest (.expr (← ofExpr inner c (m + ps.arity + ps.hasRest.toNat) x)))
+      | .block b =>
+          pure (.arrow ps.arity ps.hasRest (.block (← ofStmts inner c (m + ps.arity + ps.hasRest.toNat) b)))
   | .func isAsync isGen name params body =>
-      let ps ← paramNamesOf params
+      let ps ← paramsOf params
       match name with
       | none =>
-          let inner := env.pushMuts m ps
-          pure (.func isAsync isGen ps.length (← ofBlock inner c (m + ps.length) body))
+          let inner := env.pushMuts m ps.names
+          pure (.func isAsync isGen ps.hasRest ps.arity
+            (← ofStmts inner c (m + ps.arity + ps.hasRest.toNat) body))
       | some n =>
-          let inner := (env.pushConsts c [n]).pushMuts m ps
-          pure (.funcSelf isAsync isGen ps.length (← ofBlock inner (c + 1) (m + ps.length) body))
+          let inner := (env.pushConsts c [n]).pushMuts m ps.names
+          pure (.funcSelf isAsync isGen ps.hasRest ps.arity
+            (← ofStmts inner (c + 1) (m + ps.arity + ps.hasRest.toNat) body))
   | .spread x => pure (.spread (← ofExpr env c m x))
   | .template tag head parts =>
-      pure (.template (← ofOptExpr env c m tag) head
-        (TemplateParts.ofList (← parts.mapM fun p => do
-          pure (TemplatePart.mk (← ofExpr env c m p.expr) p.suffix))))
+      pure (.template (← ofOptExpr env c m tag) head (← ofTemplateParts env c m parts))
   | .yield x => pure (.yield (← ofOptExpr env c m x))
   | .yieldFrom x => pure (.yieldFrom (← ofExpr env c m x))
+termination_by structural e
 
-partial def ofOptExpr (env : Env) (c m : Nat) : Option MiniExpr → ConvM (OptExpr c m)
+/-- Convert an expression which may be absent. -/
+def ofOptExpr (env : Env) (c m : Nat) : Option MiniExpr → ConvM (Global.OptExpr c m g)
   | none => pure .none
   | some e => do pure (.some (← ofExpr env c m e))
+termination_by structural x => x
 
-partial def ofTarget (env : Env) (c m : Nat) (e : MiniExpr) : ConvM (Target c m) := do
+/-- Convert a list of expressions. -/
+def ofExprs (env : Env) (c m : Nat) : List MiniExpr → ConvM (Global.Exprs c m g)
+  | [] => pure .nil
+  | e :: rest => do pure (.cons (← ofExpr env c m e) (← ofExprs env c m rest))
+termination_by structural x => x
+
+/-- Convert the left hand side of an assignment. -/
+def ofTarget (env : Env) (c m : Nat) (e : MiniExpr) : ConvM (Global.Target c m g) := do
   match e with
   | .ident n => resolveTarget env c m n
   | .dot o n => pure (.dot (← ofExpr env c m o) n)
   | .index o i => pure (.index (← ofExpr env c m o) (← ofExpr env c m i))
+  | .superDot n => pure (.superDot n)
+  | .superIndex i => pure (.superIndex (← ofExpr env c m i))
   | _ => fail "an assignment target that is not a variable or a member"
+termination_by structural e
 
-partial def ofArrayElem (env : Env) (c m : Nat) : MiniArrayElement → ConvM (ArrayElem c m)
+/-- Convert the left hand side of an assignment written as a pattern.  A
+destructuring pattern and a default value are refused, so what is left is a
+name or a member access. -/
+def ofPatternTarget (env : Env) (c m : Nat) (p : MiniPattern) : ConvM (Global.Target c m g) := do
+  match p with
+  | .ident n => resolveTarget env c m n
+  | .target e => ofTarget env c m e
+  | .array _ | .object _ _ => fail "a destructuring pattern in an assignment"
+  | .withDefault _ _ => fail "a default value in an assignment target"
+termination_by structural p
+
+/-- Convert one link of an optional chain. -/
+def ofChainLink (env : Env) (c m : Nat) : MiniChainLink → ConvM (Global.ChainLink c m g)
+  | .dot opt n => pure (.dot opt n)
+  | .privateDot opt n => pure (.privateDot opt n)
+  | .index opt i => do pure (.index opt (← ofExpr env c m i))
+  | .call opt args => do pure (.call opt (← ofExprs env c m args))
+termination_by structural x => x
+
+/-- Convert the links of an optional chain. -/
+def ofChainLinks (env : Env) (c m : Nat) : List MiniChainLink → ConvM (Global.ChainLinks c m g)
+  | [] => pure .nil
+  | l :: rest => do
+      pure (.cons (← ofChainLink env c m l) (← ofChainLinks env c m rest))
+termination_by structural x => x
+
+/-- Convert an element of an array literal. -/
+def ofArrayElem (env : Env) (c m : Nat) : MiniArrayElement → ConvM (Global.ArrayElem c m g)
   | .hole => pure .hole
   | .elem e => do pure (.elem (← ofExpr env c m e))
+termination_by structural x => x
 
-partial def ofPropName (env : Env) (c m : Nat) : MiniPropertyName → ConvM (PropName c m)
+/-- Convert the elements of an array literal. -/
+def ofArrayElems (env : Env) (c m : Nat) : List MiniArrayElement → ConvM (Global.ArrayElems c m g)
+  | [] => pure .nil
+  | el :: rest => do
+      pure (.cons (← ofArrayElem env c m el) (← ofArrayElems env c m rest))
+termination_by structural x => x
+
+/-- Convert the substitutions of a template literal. -/
+def ofTemplateParts (env : Env) (c m : Nat) :
+    List MiniTemplatePart → ConvM (Global.TemplateParts c m g)
+  | [] => pure .nil
+  | ⟨e, suffix⟩ :: rest => do
+      pure (.cons (.mk (← ofExpr env c m e) suffix) (← ofTemplateParts env c m rest))
+termination_by structural x => x
+
+/-- Convert the name of a property. -/
+def ofPropName (env : Env) (c m : Nat) : MiniPropertyName → ConvM (Global.PropName c m g)
   | .ident n => pure (.ident n)
+  | .private_ n => pure (.private_ n)
   | .string v => pure (.string v)
-  | .number raw => pure (.number raw)
+  | .number n => pure (.number n)
   | .computed e => do pure (.computed (← ofExpr env c m e))
+termination_by structural x => x
 
-partial def ofProperty (env : Env) (c m : Nat) : MiniProperty → ConvM (Property c m)
+/-- Convert a member of an object literal. -/
+def ofProperty (env : Env) (c m : Nat) : MiniProperty → ConvM (Global.Property c m g)
   | .keyValue k v => do pure (.keyValue (← ofPropName env c m k) (← ofExpr env c m v))
   | .shorthand n => do pure (.keyValue (.ident n) (← resolveVar env c m n))
+  | .spread e => do pure (.spread (← ofExpr env c m e))
   | .method kind k params body => do
-      let ps ← paramNamesOf params
-      pure (.method kind (← ofPropName env c m k) ps.length
-        (← ofBlock (env.pushMuts m ps) c (m + ps.length) body))
+      let ps ← paramsOf params
+      pure (.method kind (← ofPropName env c m k) ps.arity ps.hasRest
+        (← ofStmts (env.pushMuts m ps.names) c (m + ps.arity + ps.hasRest.toNat) body))
+termination_by structural x => x
 
-partial def ofClassElem (env : Env) (c m : Nat) (el : MiniClassElement) :
-    ConvM (ClassElem c m) := do
-  let ps ← paramNamesOf el.params
-  pure (.mk el.isStatic el.kind (← ofPropName env c m el.key) ps.length
-    (← ofBlock (env.pushMuts m ps) c (m + ps.length) el.body))
-
-partial def ofClassElems (env : Env) (c m : Nat) (els : List MiniClassElement) :
-    ConvM (ClassElems c m) := do
-  pure (ClassElems.ofList (← els.mapM (ofClassElem env c m)))
-
-partial def ofSwitchCase (env : Env) (c m : Nat) : MiniSwitchCase → ConvM (SwitchCase c m)
-  | .case t b => do pure (.case (← ofExpr env c m t) (← ofBlock env c m b))
-  | .default b => do pure (.default (← ofBlock env c m b))
-
-partial def ofBody (env : Env) (c m : Nat) : MiniStatement → ConvM (Block c m)
-  | .block b => ofBlock env c m b
-  | .empty => pure .nil
-  | s => ofBlock env c m [s]
-
-partial def ofOptBody (env : Env) (c m : Nat) : Option MiniStatement → ConvM (OptBlock c m)
-  | none => pure .none
-  | some s => do pure (.some (← ofBody env c m s))
-
-partial def ofBlock (env : Env) (c m : Nat) (stmts : List MiniStatement) :
-    ConvM (Block c m) :=
-  ofStmts env c m (expandStmts stmts)
-
-partial def ofStmts (env : Env) (c m : Nat) : List MiniStatement → ConvM (Block c m)
+/-- Convert the members of an object literal. -/
+def ofProperties (env : Env) (c m : Nat) : List MiniProperty → ConvM (Global.Properties c m g)
   | [] => pure .nil
+  | p :: rest => do pure (.cons (← ofProperty env c m p) (← ofProperties env c m rest))
+termination_by structural x => x
+
+/-- Convert a member of a class body. -/
+def ofClassElem (env : Env) (c m : Nat) : MiniClassElement → ConvM (Global.ClassElem c m g)
+  | .method decorators isStatic kind key params body => do
+      let ps ← paramsOf params
+      pure (.method (← ofExprs env c m decorators) isStatic kind (← ofPropName env c m key)
+        ps.arity ps.hasRest
+        (← ofStmts (env.pushMuts m ps.names) c (m + ps.arity + ps.hasRest.toNat) body))
+  | .field decorators isStatic key init => do
+      pure (.field (← ofExprs env c m decorators) isStatic (← ofPropName env c m key)
+        (← ofOptExpr env c m init))
+  | .staticBlock body => do pure (.staticBlock (← ofStmts env c m body))
+termination_by structural x => x
+
+/-- Convert a class body. -/
+def ofClassElems (env : Env) (c m : Nat) :
+    List MiniClassElement → ConvM (Global.ClassElems c m g)
+  | [] => pure .nil
+  | el :: rest => do
+      pure (.cons (← ofClassElem env c m el) (← ofClassElems env c m rest))
+termination_by structural x => x
+
+/-- Convert one `case`/`default` of a `switch`. -/
+def ofSwitchCase (env : Env) (c m : Nat) : MiniSwitchCase → ConvM (Global.SwitchCase c m g)
+  | .case t b => do pure (.case (← ofExpr env c m t) (← ofStmts env c m b))
+  | .default b => do pure (.default (← ofStmts env c m b))
+termination_by structural x => x
+
+/-- Convert the cases of a `switch`. -/
+def ofSwitchCases (env : Env) (c m : Nat) :
+    List MiniSwitchCase → ConvM (Global.SwitchCases c m g)
+  | [] => pure .nil
+  | k :: rest => do
+      pure (.cons (← ofSwitchCase env c m k) (← ofSwitchCases env c m rest))
+termination_by structural x => x
+
+/-- Convert one declarator of a `var`/`let`/`const` inside a block, then
+whatever follows it, in the scope the declarator extends. -/
+def ofDeclThenBlock (kind : DeclKind) (d : MiniDeclarator) (env : Env) (c m : Nat)
+    (kont : (env : Env) → (c' m' : Nat) → ConvM (Global.Block c' m' g)) : ConvM (Global.Block c m g) :=
+  match d with
+  | ⟨lhs, init⟩ =>
+      match kind with
+      | .using_ isAwait =>
+          match init with
+          | none => do
+              let _ ← binderName lhs
+              fail "a `using` declaration without an initialiser"
+          | some i => do
+              let n ← binderName lhs
+              let i' ← ofExpr env c m i
+              let tl ← kont (⟨n, true, c⟩ :: env) (c + 1) m
+              pure (blockConsUsing c m isAwait i' tl)
+      | .var_ .const =>
+          match init with
+          | none => do
+              let _ ← binderName lhs
+              fail "a const declaration without an initialiser"
+          | some i => do
+              let n ← binderName lhs
+              let i' ← ofExpr env c m i
+              let tl ← kont (⟨n, true, c⟩ :: env) (c + 1) m
+              pure (blockConsConst c m i' tl)
+      | _ => do
+          let n ← binderName lhs
+          let i' ← ofOptExpr env c m init
+          let tl ← kont (⟨n, false, m⟩ :: env) c (m + 1)
+          pure (blockConsLet c m i' tl)
+termination_by structural d
+
+/-- Convert the remaining declarators of a `var`/`let`/`const` inside a
+block, then whatever follows them. -/
+def ofDeclsThenBlock (kind : DeclKind) (ds : List MiniDeclarator) (env : Env) (c m : Nat)
+    (kont : (env : Env) → (c' m' : Nat) → ConvM (Global.Block c' m' g)) : ConvM (Global.Block c m g) := do
+  match ds with
+  | [] => kont env c m
+  | d :: ds =>
+      ofDeclThenBlock kind d env c m fun env c m =>
+        ofDeclsThenBlock kind ds env c m kont
+termination_by structural ds
+
+/-- Convert one declarator of a top level `var`/`let`/`const`, then
+whatever follows it. -/
+def ofDeclThenItems (exported : Bool) (kind : DeclKind) (d : MiniDeclarator)
+    (env : Env) (c m : Nat)
+    (kont : (env : Env) → (c' m' : Nat) → ConvM (Global.ModuleItems c' m' g)) :
+    ConvM (Global.ModuleItems c m g) := do
+  match d with
+  | ⟨lhs, init⟩ =>
+      let n ← binderName lhs
+      match kind with
+      | .using_ isAwait =>
+          match init with
+          | none => fail "a `using` declaration without an initialiser"
+          | some i =>
+              let i' ← ofExpr env c m i
+              let tl ← kont (⟨n, true, c⟩ :: env) (c + 1) m
+              pure (itemsConsUsing exported isAwait c m i' tl)
+      | .var_ .const =>
+          match init with
+          | none => fail "a const declaration without an initialiser"
+          | some i =>
+              let i' ← ofExpr env c m i
+              let tl ← kont (⟨n, true, c⟩ :: env) (c + 1) m
+              pure (itemsConsConst exported c m i' tl)
+      | _ =>
+          let i' ← ofOptExpr env c m init
+          let tl ← kont (⟨n, false, m⟩ :: env) c (m + 1)
+          pure (itemsConsLet exported c m i' tl)
+
+/-- Convert the remaining declarators of a top level `var`/`let`/`const`,
+then whatever follows them. -/
+def ofDeclsThenItems (exported : Bool) (kind : DeclKind) (ds : List MiniDeclarator)
+    (env : Env) (c m : Nat)
+    (kont : (env : Env) → (c' m' : Nat) → ConvM (Global.ModuleItems c' m' g)) :
+    ConvM (Global.ModuleItems c m g) := do
+  match ds with
+  | [] => kont env c m
+  | d :: ds =>
+      ofDeclThenItems exported kind d env c m fun env c m =>
+        ofDeclsThenItems exported kind ds env c m kont
+termination_by structural ds
+
+/-- Convert the statements of a block.  An empty statement disappears and a
+declaration of several variables becomes one statement per declarator, as
+in the deterministic tree's own reading of a block. -/
+def ofStmts (env : Env) (c m : Nat) : List MiniStatement → ConvM (Global.Block c m g)
+  | [] => pure .nil
+  | .empty :: rest => ofStmts env c m rest
+  | .decl kind ⟨d, ds⟩ :: rest =>
+      ofDeclThenBlock (.var_ kind) d env c m fun env c m =>
+        ofDeclsThenBlock (.var_ kind) ds env c m fun env c m =>
+          ofStmts env c m rest
+  | .using_ isAwait ⟨d, ds⟩ :: rest =>
+      ofDeclThenBlock (.using_ isAwait) d env c m fun env c m =>
+        ofDeclsThenBlock (.using_ isAwait) ds env c m fun env c m =>
+          ofStmts env c m rest
   | s :: rest => do
       let r ← ofStmt env c m s
       let tl ← ofStmts (r.binds.reverse ++ env) (c + r.dc) (m + r.dm) rest
       pure (.cons r.stmt tl)
+termination_by structural x => x
 
-partial def ofForInOf (env : Env) (c m : Nat) (isOf : Bool) (head : MiniForHead)
-    (obj : MiniExpr) (body : MiniStatement) : ConvM (StmtRes c m) := do
-  let obj' ← ofExpr env c m obj
-  match head with
-  | .pattern lhs =>
-      let t ← ofTarget env c m lhs
-      let b ← ofBody env c m body
-      return ⟨0, 0, if isOf then .forOf (.target t) obj' b else .forIn (.target t) obj' b, []⟩
-  | .decl kind lhs =>
-      let n ← binderName lhs
-      match kind with
-      | .const =>
-          let b ← ofBody (env.pushConsts c [n]) (c + 1) m body
-          return ⟨0, 0, if isOf then .forOf .constBind obj' b else .forIn .constBind obj' b, []⟩
-      | _ =>
-          let b ← ofBody (env.pushMuts m [n]) c (m + 1) body
-          return ⟨0, 0, if isOf then .forOf .letBind obj' b else .forIn .letBind obj' b, []⟩
+/-- The body of an `if`, a loop or a `for`, as a block.  `self` is the
+conversion of `s` as a statement, which only the last case needs; the
+caller passes it because `s` is a component of the node it is converting,
+so that this stays a recursion on components. -/
+def ofBody (env : Env) (c m : Nat) (s : MiniStatement)
+    (self : ConvM (StmtRes c m g)) : ConvM (Global.Block c m g) :=
+  match s with
+  | .block b => ofStmts env c m b
+  | .empty => pure .nil
+  | .decl kind ⟨d, ds⟩ =>
+      ofDeclThenBlock (.var_ kind) d env c m fun env c m =>
+        ofDeclsThenBlock (.var_ kind) ds env c m fun _ _ _ => pure .nil
+  | .using_ isAwait ⟨d, ds⟩ =>
+      ofDeclThenBlock (.using_ isAwait) d env c m fun env c m =>
+        ofDeclsThenBlock (.using_ isAwait) ds env c m fun _ _ _ => pure .nil
+  | _ => do
+      let r ← self
+      pure (.cons r.stmt .nil)
+termination_by structural s
 
-partial def ofForC (env : Env) (c m : Nat) (init : MiniForInit) (cond step : Option MiniExpr)
-    (body : MiniStatement) : ConvM (StmtRes c m) := do
-  match init with
-  | .none =>
-      return ⟨0, 0, .for_ .none (← ofOptExpr env c m cond) (← ofOptExpr env c m step)
-        (← ofBody env c m body), []⟩
-  | .expr e =>
-      let e' ← ofExpr env c m e
-      return ⟨0, 0, .for_ (.expr e') (← ofOptExpr env c m cond) (← ofOptExpr env c m step)
-        (← ofBody env c m body), []⟩
-  | .decl kind decls =>
-      match decls.tl with
-      | _ :: _ => fail "a `for` clause that declares several variables"
-      | [] =>
-        let d := decls.hd
-        let n ← binderName d.lhs
-        match kind with
-        | .const =>
-            match d.init with
-            | none => fail "a const declaration without an initialiser"
-            | some i =>
-                let i' ← ofExpr env c m i
-                let inner := env.pushConsts c [n]
-                return ⟨0, 0, .for_ (.constDecl i') (← ofOptExpr inner (c + 1) m cond)
-                  (← ofOptExpr inner (c + 1) m step) (← ofBody inner (c + 1) m body), []⟩
-        | _ =>
-            let i' ← ofOptExpr env c m d.init
-            let inner := env.pushMuts m [n]
-            return ⟨0, 0, .for_ (.letDecl i') (← ofOptExpr inner c (m + 1) cond)
-              (← ofOptExpr inner c (m + 1) step) (← ofBody inner c (m + 1) body), []⟩
-
-partial def ofStmt (env : Env) (c m : Nat) (s : MiniStatement) : ConvM (StmtRes c m) := do
+/-- Convert a statement, together with what it binds. -/
+def ofStmt (env : Env) (c m : Nat) (s : MiniStatement) : ConvM (StmtRes c m g) := do
   match s with
   | .expr e => return ⟨0, 0, .expr (← ofExpr env c m e), []⟩
   | .empty => return ⟨0, 0, .block .nil, []⟩
-  | .decl kind decls =>
-      match decls.tl with
+  | .decl kind ⟨⟨lhs, init⟩, ds⟩ =>
+      match ds with
       | _ :: _ => fail "a declaration of several variables (it should have been split)"
       | [] =>
-        let d := decls.hd
-        let n ← binderName d.lhs
+        let n ← binderName lhs
         match kind with
         | .const =>
-            match d.init with
+            match init with
             | none => fail "a const declaration without an initialiser"
             | some i => return ⟨1, 0, .constDecl (← ofExpr env c m i), [⟨n, true, c⟩]⟩
-        | _ => return ⟨0, 1, .letDecl (← ofOptExpr env c m d.init), [⟨n, false, m⟩]⟩
-  | .block b => return ⟨0, 0, .block (← ofBlock env c m b), []⟩
+        | _ => return ⟨0, 1, .letDecl (← ofOptExpr env c m init), [⟨n, false, m⟩]⟩
+  | .using_ isAwait ⟨⟨lhs, init⟩, ds⟩ =>
+      match ds with
+      | _ :: _ => fail "a `using` declaration of several variables (it should have been split)"
+      | [] =>
+        let n ← binderName lhs
+        match init with
+        | none => fail "a `using` declaration without an initialiser"
+        | some i => return ⟨1, 0, .usingDecl isAwait (← ofExpr env c m i), [⟨n, true, c⟩]⟩
+  | .block b => return ⟨0, 0, .block (← ofStmts env c m b), []⟩
   | .if_ cond t e =>
-      return ⟨0, 0, .if_ (← ofExpr env c m cond) (← ofBody env c m t)
-        (← ofOptBody env c m e), []⟩
-  | .while_ cond b => return ⟨0, 0, .while_ (← ofExpr env c m cond) (← ofBody env c m b), []⟩
-  | .doWhile b cond => return ⟨0, 0, .doWhile (← ofBody env c m b) (← ofExpr env c m cond), []⟩
-  | .for_ init cond step body => ofForC env c m init cond step body
-  | .forIn head obj body => ofForInOf env c m false head obj body
-  | .forOf head obj body => ofForInOf env c m true head obj body
+      let cond' ← ofExpr env c m cond
+      let tb ← ofBody env c m t (ofStmt env c m t)
+      let eb : Global.OptBlock c m g ←
+        match e with
+        | none => pure .none
+        | some s => do pure (.some (← ofBody env c m s (ofStmt env c m s)))
+      return ⟨0, 0, .if_ cond' tb eb, []⟩
+  | .while_ cond b =>
+      return ⟨0, 0, .while_ (← ofExpr env c m cond) (← ofBody env c m b (ofStmt env c m b)), []⟩
+  | .doWhile b cond =>
+      return ⟨0, 0, .doWhile (← ofBody env c m b (ofStmt env c m b)) (← ofExpr env c m cond), []⟩
+  | .for_ init cond step body =>
+      match init with
+      | .none =>
+          return ⟨0, 0, .for_ .none (← ofOptExpr env c m cond) (← ofOptExpr env c m step)
+            (← ofBody env c m body (ofStmt env c m body)), []⟩
+      | .expr e =>
+          let e' ← ofExpr env c m e
+          return ⟨0, 0, .for_ (.expr e') (← ofOptExpr env c m cond) (← ofOptExpr env c m step)
+            (← ofBody env c m body (ofStmt env c m body)), []⟩
+      | .decl kind ⟨⟨lhs, dinit⟩, ds⟩ =>
+          match ds with
+          | _ :: _ => fail "a `for` clause that declares several variables"
+          | [] =>
+            let n ← binderName lhs
+            match kind with
+            | .const =>
+                match dinit with
+                | none => fail "a const declaration without an initialiser"
+                | some i =>
+                    let i' ← ofExpr env c m i
+                    let inner := env.pushConsts c [n]
+                    return ⟨0, 0, .for_ (.constDecl i') (← ofOptExpr inner (c + 1) m cond)
+                      (← ofOptExpr inner (c + 1) m step)
+                      (← ofBody inner (c + 1) m body (ofStmt inner (c + 1) m body)), []⟩
+            | _ =>
+                let i' ← ofOptExpr env c m dinit
+                let inner := env.pushMuts m [n]
+                return ⟨0, 0, .for_ (.letDecl i') (← ofOptExpr inner c (m + 1) cond)
+                  (← ofOptExpr inner c (m + 1) step)
+                  (← ofBody inner c (m + 1) body (ofStmt inner c (m + 1) body)), []⟩
+  | .forIn head obj body =>
+      let obj' ← ofExpr env c m obj
+      match head with
+      | .pattern lhs =>
+          let t ← ofPatternTarget env c m lhs
+          let b ← ofBody env c m body (ofStmt env c m body)
+          return ⟨0, 0, .forIn (.target t) obj' b, []⟩
+      | .decl kind lhs =>
+          let n ← binderName lhs
+          match kind with
+          | .const =>
+              let inner := env.pushConsts c [n]
+              let b ← ofBody inner (c + 1) m body (ofStmt inner (c + 1) m body)
+              return ⟨0, 0, .forIn .constBind obj' b, []⟩
+          | _ =>
+              let inner := env.pushMuts m [n]
+              let b ← ofBody inner c (m + 1) body (ofStmt inner c (m + 1) body)
+              return ⟨0, 0, .forIn .letBind obj' b, []⟩
+  | .forOf head obj body =>
+      let obj' ← ofExpr env c m obj
+      match head with
+      | .pattern lhs =>
+          let t ← ofPatternTarget env c m lhs
+          let b ← ofBody env c m body (ofStmt env c m body)
+          return ⟨0, 0, .forOf (.target t) obj' b, []⟩
+      | .decl kind lhs =>
+          let n ← binderName lhs
+          match kind with
+          | .const =>
+              let inner := env.pushConsts c [n]
+              let b ← ofBody inner (c + 1) m body (ofStmt inner (c + 1) m body)
+              return ⟨0, 0, .forOf .constBind obj' b, []⟩
+          | _ =>
+              let inner := env.pushMuts m [n]
+              let b ← ofBody inner c (m + 1) body (ofStmt inner c (m + 1) body)
+              return ⟨0, 0, .forOf .letBind obj' b, []⟩
   | .funcDecl isAsync isGen name params body =>
-      let ps ← paramNamesOf params
-      let inner := (env.pushConsts c [name]).pushMuts m ps
-      let b ← ofBlock inner (c + 1) (m + ps.length) body
-      return ⟨1, 0, .funcDecl isAsync isGen ps.length b, [⟨name, true, c⟩]⟩
-  | .classDecl name heritage body =>
+      let ps ← paramsOf params
+      let inner := (env.pushConsts c [name]).pushMuts m ps.names
+      let b ← ofStmts inner (c + 1) (m + ps.arity + ps.hasRest.toNat) body
+      return ⟨1, 0, .funcDecl isAsync isGen ps.hasRest ps.arity b, [⟨name, true, c⟩]⟩
+  | .classDecl decorators name heritage body =>
+      let ds ← ofExprs env c m decorators
       let her ← ofOptExpr env c m heritage
       let els ← ofClassElems (env.pushConsts c [name]) (c + 1) m body
-      return ⟨1, 0, .classDecl her els, [⟨name, true, c⟩]⟩
+      return ⟨1, 0, .classDecl ds her els, [⟨name, true, c⟩]⟩
   | .return_ e => return ⟨0, 0, .return_ (← ofOptExpr env c m e), []⟩
   | .throw e => return ⟨0, 0, .throw (← ofExpr env c m e), []⟩
   | .break_ l => return ⟨0, 0, .break_ l, []⟩
   | .continue_ l => return ⟨0, 0, .continue_ l, []⟩
   | .labelled l s' =>
-      let ⟨dc, dm, st, _⟩ ← ofStmt env c m s'
-      match dc, dm, st with
-      | 0, 0, st' => return ⟨0, 0, .labelled l st', []⟩
-      | _, _, _ => fail "a labelled statement that declares a variable"
+      -- a label may carry a declaration, a labelled function declaration
+      -- being the usual case, so what the statement binds is what the
+      -- labelled statement binds
+      let ⟨dc, dm, st, binds⟩ ← ofStmt env c m s'
+      return ⟨dc, dm, .labelled l st, binds⟩
   | .switch d cases =>
-      return ⟨0, 0, .switch (← ofExpr env c m d)
-        (SwitchCases.ofList (← cases.mapM (ofSwitchCase env c m))), []⟩
+      return ⟨0, 0, .switch (← ofExpr env c m d) (← ofSwitchCases env c m cases), []⟩
   | .try_ body tail =>
-      let b ← ofBlock env c m body
+      let b ← ofStmts env c m body
       match tail with
-      | .finallyOnly fb => return ⟨0, 0, .try_ b (.finallyOnly (← ofBlock env c m fb)), []⟩
-      | .catches cs fin =>
-          match cs.tl with
+      | .finallyOnly fb => return ⟨0, 0, .try_ b (.finallyOnly (← ofStmts env c m fb)), []⟩
+      | .catches ⟨cat, cs⟩ fin =>
+          match cs with
           | _ :: _ => fail "a `try` with several catch clauses"
           | [] =>
-            let cat := cs.hd
-            match cat.guard with
-            | some _ => fail "a catch clause with a guard"
-            | none =>
-                let n ← binderName cat.param
-                let cb ← ofBlock (env.pushMuts m [n]) c (m + 1) cat.body
-                let f : OptBlock c m ←
-                  match fin with
-                  | .none => pure .none
-                  | .some fb => do pure (.some (← ofBlock env c m fb))
-                return ⟨0, 0, .try_ b (.catch_ cb f), []⟩
+            match cat with
+            | ⟨param, guard, cbody⟩ =>
+              match guard with
+              | some _ => fail "a catch clause with a guard"
+              | none =>
+                  let n ← binderName param
+                  let cb ← ofStmts (env.pushMuts m [n]) c (m + 1) cbody
+                  let f : Global.OptBlock c m g ←
+                    match fin with
+                    | .none => pure .none
+                    | .some fb => do pure (.some (← ofStmts env c m fb))
+                  return ⟨0, 0, .try_ b (.catch_ cb f), []⟩
   | .with_ _ _ => fail "a `with` statement (its scope is dynamic)"
+termination_by structural s
 
-end
-
-def ofModuleItem (env : Env) (c m : Nat) : MiniModuleItem → ConvM (ItemRes c m)
+/-- Convert a top level item, together with what it binds. -/
+def ofModuleItem (env : Env) (c m : Nat) : MiniModuleItem → ConvM (ItemRes c m g)
   | .stmt s => do
       let r ← ofStmt env c m s
       return ⟨r.dc, r.dm, .stmt r.stmt, r.binds⟩
-  | .importDecl (.bare mod) => pure ⟨0, 0, .importBare mod, []⟩
+  | .importDecl (.bare mod attrs) => pure ⟨0, 0, .importBare mod attrs, []⟩
   | .importDecl (.clause cl) => do
       let specs := cl.named.getD []
       let names := specs.map (·.name)
       let locals :=
         cl.default_.toList ++ cl.namespace_.toList ++ specs.map fun s => s.alias_.getD s.name
-      match ImportClause.mk? cl.mod cl.default_.isSome cl.namespace_.isSome names with
+      match ImportClause.mk? cl.mod cl.default_.isSome cl.namespace_.isSome names cl.attrs with
       | none => fail "an import that binds nothing"
       | some clause =>
           return ⟨clause.count, 0, .importClause clause,
             locals.zipIdx.map fun (n, j) => ⟨n, true, c + j⟩⟩
-  | .exportDecl (.fromClause specs mod) => pure ⟨0, 0, .exportFrom specs mod, []⟩
+  | .exportDecl (.fromClause specs mod attrs) => pure ⟨0, 0, .exportFrom specs mod attrs, []⟩
+  | .exportDecl (.all alias_ mod attrs) => pure ⟨0, 0, .exportAll alias_ mod attrs, []⟩
+  | .exportDecl (.defaultExpr e) => do
+      return ⟨0, 0, .exportDefaultExpr (← ofExpr env c m e), []⟩
   | .exportDecl (.locals specs) => do
       let entries ← specs.mapM fun sp =>
         resolveExportLocal env c m sp.name (sp.alias_.getD sp.name)
@@ -392,17 +779,56 @@ def ofModuleItem (env : Env) (c m : Nat) : MiniModuleItem → ConvM (ItemRes c m
       let r ← ofStmt env c m s
       return ⟨r.dc, r.dm, .exportDecl r.stmt, r.binds⟩
 
-partial def ofItems (env : Env) (c m : Nat) : List MiniModuleItem → ConvM (ModuleItems c m)
+/-- Convert the top level items.  As in a block, an empty statement
+disappears and a declaration of several variables — exported or not —
+becomes one item per declarator. -/
+def ofItems (env : Env) (c m : Nat) : List MiniModuleItem → ConvM (Global.ModuleItems c m g)
   | [] => pure .nil
+  | .stmt .empty :: rest => ofItems env c m rest
+  | .stmt (.decl kind ⟨d, ds⟩) :: rest =>
+      ofDeclThenItems false (.var_ kind) d env c m fun env c m =>
+        ofDeclsThenItems false (.var_ kind) ds env c m fun env c m =>
+          ofItems env c m rest
+  | .stmt (.using_ isAwait ⟨d, ds⟩) :: rest =>
+      ofDeclThenItems false (.using_ isAwait) d env c m fun env c m =>
+        ofDeclsThenItems false (.using_ isAwait) ds env c m fun env c m =>
+          ofItems env c m rest
+  | .exportDecl (.decl .empty) :: rest => ofItems env c m rest
+  | .exportDecl (.decl (.decl kind ⟨d, ds⟩)) :: rest =>
+      ofDeclThenItems true (.var_ kind) d env c m fun env c m =>
+        ofDeclsThenItems true (.var_ kind) ds env c m fun env c m =>
+          ofItems env c m rest
+  | .exportDecl (.decl (.using_ isAwait ⟨d, ds⟩)) :: rest =>
+      ofDeclThenItems true (.using_ isAwait) d env c m fun env c m =>
+        ofDeclsThenItems true (.using_ isAwait) ds env c m fun env c m =>
+          ofItems env c m rest
   | it :: rest => do
       let r ← ofModuleItem env c m it
       let tl ← ofItems (r.binds.reverse ++ env) (c + r.dc) (m + r.dm) rest
       pure (.cons r.item tl)
+termination_by structural x => x
 
-def ofMiniProgram (p : MiniProgram) : ConvM Program := do
-  pure ⟨← ofItems [] 0 0 (expandItems p.items)⟩
+end
 
-def parse (input : String) : ConvM Program := do
+/-- The unknown globals `p` mentions: the names the first pass, run against
+the empty set, could not place. -/
+def freeGlobals (p : MiniProgram) : ResM (Finset NEString) := do
+  let (_, missing) ← (ofItems (g := (∅ : Finset NEString)) [] 0 0 p.items).run ∅
+  pure missing
+
+/-- Convert a `MiniProgram`, against a set of globals given in advance.  It
+fails if the program mentions an unknown global which is not in the set. -/
+def ofMiniProgramWith (globals : Finset NEString) (p : MiniProgram) : ResM Program := do
+  let (items, missing) ← (ofItems (g := globals) [] 0 0 p.items).run ∅
+  if missing = ∅ then pure ⟨globals, items⟩
+  else .error "BrujinAST: the program mentions unknown globals which are not in the given set"
+
+/-- Convert a `MiniProgram`, computing the set of unknown globals it
+mentions. -/
+def ofMiniProgram (p : MiniProgram) : ResM Program := do
+  ofMiniProgramWith (← freeGlobals p) p
+
+def parse (input : String) : ResM Program := do
   ofMiniProgram (← MiniAST.parse input)
 
 def isIdentChar (ch : Char) : Bool := ch.isAlphanum || ch == '_' || ch == '$'
@@ -416,75 +842,137 @@ inductive ScanMode where
   | blockComment
 deriving Repr, DecidableEq, Inhabited
 
-partial def rewriteAux (stack : List ScanMode) (prev : Char) (cs : List Char) (acc : String) :
-    String :=
-  match cs with
-  | [] => acc
-  | ch :: rest =>
+/-- The number written in decimal at the byte index `p`, the index just
+after it, and whether there was a digit at all.
+
+The scan is well founded on the number of bytes of the input still to be
+read; it takes no step counter. -/
+private def digitsAt (input : String) (p : String.Pos.Raw) (value : Nat)
+    (any : Bool) : Nat × String.Pos.Raw × Bool :=
+  if _h : input.utf8ByteSize ≤ p.byteIdx then (value, p, any)
+  else if (String.Pos.Raw.get input p).isDigit then
+    digitsAt input (String.Pos.Raw.next input p)
+      (10 * value + ((String.Pos.Raw.get input p).toNat - '0'.toNat)) true
+  else (value, p, any)
+termination_by input.utf8ByteSize - p.byteIdx
+decreasing_by
+  have := String.Pos.Raw.byteIdx_lt_byteIdx_next input p
+  omega
+
+/-- Reading the digits never moves backwards. -/
+private theorem digitsAt_le (input : String) (p : String.Pos.Raw) (value : Nat) (any : Bool) :
+    p.byteIdx ≤ (digitsAt input p value any).2.1.byteIdx := by
+  rw [digitsAt]
+  split
+  · exact Nat.le_refl _
+  · split
+    · exact Nat.le_trans (Nat.le_of_lt (String.Pos.Raw.byteIdx_lt_byteIdx_next input p))
+        (digitsAt_le input (String.Pos.Raw.next input p) _ _)
+    · exact Nat.le_refl _
+termination_by input.utf8ByteSize - p.byteIdx
+decreasing_by
+  rename_i hend _
+  have := String.Pos.Raw.byteIdx_lt_byteIdx_next input p
+  omega
+
+/-- Rewrite the index references of `input` from the byte index `p` on,
+`stack` describing what is being scanned and `prev` being the character
+before `p`.
+
+The input is read in place, by byte index, and the result is built by
+pushing onto `acc`: neither the input nor the tail it is skipping ever
+becomes a list of characters.
+
+The scan is well founded on the number of bytes of the input still to be
+read: it stops at the end of the input, and every step reads at least one
+byte.  It takes no step counter, so it does not have to be told how long
+its input is. -/
+def rewriteAux (input : String) (stack : List ScanMode) (prev : Char)
+    (p : String.Pos.Raw) (acc : String) : String :=
+  let size := input.utf8ByteSize
+  if _hend : size ≤ p.byteIdx then acc
+  else
+    let ch := String.Pos.Raw.get input p
+    let q := String.Pos.Raw.next input p
+    let q2 := String.Pos.Raw.next input q
+    let nextIs (c : Char) : Bool := q.byteIdx < size && String.Pos.Raw.get input q == c
     match stack with
-    | [] => acc ++ String.ofList cs
+    | [] => acc ++ String.Pos.Raw.extract input p ⟨size⟩
     | .string d :: st =>
         if ch == '\\' then
-          match rest with
-          | [] => acc.push ch
-          | e :: more => rewriteAux stack e more ((acc.push ch).push e)
-        else if ch == d then rewriteAux st ch rest (acc.push ch)
-        else rewriteAux stack ch rest (acc.push ch)
+          if size ≤ q.byteIdx then acc.push ch
+          else
+            let e := String.Pos.Raw.get input q
+            rewriteAux input stack e q2 ((acc.push ch).push e)
+        else if ch == d then rewriteAux input st ch q (acc.push ch)
+        else rewriteAux input stack ch q (acc.push ch)
     | .template :: st =>
         if ch == '\\' then
-          match rest with
-          | [] => acc.push ch
-          | e :: more => rewriteAux stack e more ((acc.push ch).push e)
-        else if ch == '`' then rewriteAux st ch rest (acc.push ch)
-        else if ch == '$' && rest.head? == some '{' then
-          rewriteAux (.subst 0 :: stack) ' ' (rest.drop 1) ((acc.push ch).push '{')
-        else rewriteAux stack ch rest (acc.push ch)
+          if size ≤ q.byteIdx then acc.push ch
+          else
+            let e := String.Pos.Raw.get input q
+            rewriteAux input stack e q2 ((acc.push ch).push e)
+        else if ch == '`' then rewriteAux input st ch q (acc.push ch)
+        else if ch == '$' && nextIs '{' then
+          rewriteAux input (.subst 0 :: stack) ' ' q2 ((acc.push ch).push '{')
+        else rewriteAux input stack ch q (acc.push ch)
     | .lineComment :: st =>
-        if ch == '\n' then rewriteAux st ch rest (acc.push ch)
-        else rewriteAux stack ch rest (acc.push ch)
+        if ch == '\n' then rewriteAux input st ch q (acc.push ch)
+        else rewriteAux input stack ch q (acc.push ch)
     | .blockComment :: st =>
-        if prev == '*' && ch == '/' then rewriteAux st ch rest (acc.push ch)
-        else rewriteAux stack ch rest (acc.push ch)
+        if prev == '*' && ch == '/' then rewriteAux input st ch q (acc.push ch)
+        else rewriteAux input stack ch q (acc.push ch)
     | m :: st =>
         if (ch == 'c' || ch == 'l') && !isIdentChar prev then
-          match rest with
-          | '#' :: more =>
-              let ds := more.takeWhile Char.isDigit
-              if ds.isEmpty then rewriteAux stack ch rest (acc.push ch)
-              else
-                let i := (String.ofList ds).toNat!
-                let name := if ch == 'c' then (idxConstIdent i).val else (idxMutIdent i).val
-                rewriteAux stack '0' (more.drop ds.length) (acc ++ name)
-          | _ => rewriteAux stack ch rest (acc.push ch)
+          if nextIs '#' then
+            let d := digitsAt input q2 0 false
+            if !d.2.2 then rewriteAux input stack ch q (acc.push ch)
+            else
+              let name := if ch == 'c' then (idxConstIdent d.1).val else (idxMutIdent d.1).val
+              rewriteAux input stack '0' d.2.1 (acc ++ name)
+          else rewriteAux input stack ch q (acc.push ch)
         else if ch == '"' || ch == '\'' then
-          rewriteAux (.string ch :: stack) ch rest (acc.push ch)
-        else if ch == '`' then rewriteAux (.template :: stack) ch rest (acc.push ch)
-        else if ch == '/' && rest.head? == some '/' then
-          rewriteAux (.lineComment :: stack) ' ' (rest.drop 1) ((acc.push ch).push '/')
-        else if ch == '/' && rest.head? == some '*' then
-          rewriteAux (.blockComment :: stack) ' ' (rest.drop 1) ((acc.push ch).push '*')
+          rewriteAux input (.string ch :: stack) ch q (acc.push ch)
+        else if ch == '`' then rewriteAux input (.template :: stack) ch q (acc.push ch)
+        else if ch == '/' && nextIs '/' then
+          rewriteAux input (.lineComment :: stack) ' ' q2 ((acc.push ch).push '/')
+        else if ch == '/' && nextIs '*' then
+          rewriteAux input (.blockComment :: stack) ' ' q2 ((acc.push ch).push '*')
         else
           match m with
           | .subst d =>
-              if ch == '{' then rewriteAux (.subst (d + 1) :: st) ch rest (acc.push ch)
+              if ch == '{' then rewriteAux input (.subst (d + 1) :: st) ch q (acc.push ch)
               else if ch == '}' then
-                if d == 0 then rewriteAux st ch rest (acc.push ch)
-                else rewriteAux (.subst (d - 1) :: st) ch rest (acc.push ch)
-              else rewriteAux stack ch rest (acc.push ch)
-          | _ => rewriteAux stack ch rest (acc.push ch)
+                if d == 0 then rewriteAux input st ch q (acc.push ch)
+                else rewriteAux input (.subst (d - 1) :: st) ch q (acc.push ch)
+              else rewriteAux input stack ch q (acc.push ch)
+          | _ => rewriteAux input stack ch q (acc.push ch)
+termination_by input.utf8ByteSize - p.byteIdx
+decreasing_by
+  all_goals
+    have h1 := String.Pos.Raw.byteIdx_lt_byteIdx_next input p
+    have h2 := String.Pos.Raw.byteIdx_lt_byteIdx_next input (String.Pos.Raw.next input p)
+    have h3 := digitsAt_le input (String.Pos.Raw.next input (String.Pos.Raw.next input p)) 0 false
+    omega
 
 def rewriteIndexRefs (input : String) : String :=
-  rewriteAux [.code] ' ' input.toList ""
+  rewriteAux input [.code] ' ' ⟨0⟩ ""
 
-def parseIndexed (input : String) : ConvM Program :=
+def parseIndexed (input : String) : ResM Program :=
   parse (rewriteIndexRefs input)
 
 def parseIndexed! (input : String) : Program := (parseIndexed input).toOption.getD default
 
-def parseExprIndexed (c m : Nat) (input : String) : ConvM (Expr c m) := do
-  ofExpr [] c m (← MiniAST.parseExpr (rewriteIndexRefs input))
+/-- Read a single expression in the scope `(c, m)`, computing the set of
+unknown globals it mentions. -/
+def parseExprIndexed (c m : Nat) (input : String) : ResM (ScopedExpr c m) := do
+  let e ← MiniAST.parseExpr (rewriteIndexRefs input)
+  let (_, globals) ← (ofExpr (g := (∅ : Finset NEString)) [] c m e).run ∅
+  let (expr, missing) ← (ofExpr (g := globals) [] c m e).run ∅
+  if missing = ∅ then pure ⟨globals, expr⟩
+  else .error "BrujinAST: the set of globals of the expression is not closed"
 
-def parseExprIndexed! (c m : Nat) (input : String) : Expr c m :=
+def parseExprIndexed! (c m : Nat) (input : String) : ScopedExpr c m :=
   (parseExprIndexed c m input).toOption.getD default
 
 end Language.JavaScript.BrujinAST
