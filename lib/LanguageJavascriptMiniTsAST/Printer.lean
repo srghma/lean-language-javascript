@@ -1,16 +1,16 @@
-import MiniAST.Syntax
+import MiniTsAST.Syntax
 import MiniAST.Unicode
-import MiniAST.JSX
+import MiniTsAST.JSX
 import MiniAST.Options
 
 /-!
 # The printer
 
-A printer for `MiniAST` that reproduces the output of the `prettier` code
-formatter.  It is read as a `Language.JavaScript.Options`, prettier's
-options record, which every function of the printer takes as an instance
-argument; `Language.JavaScript.defaultOptions` is prettier's default
-style (two space indentation, eighty column lines, double quotes,
+A printer for `MiniTsAST` that reproduces the output of the `prettier`
+code formatter.  It is read as a `Language.JavaScript.Options`,
+prettier's options record, which every function of the printer takes as
+an instance argument; `Language.JavaScript.defaultOptions` is prettier's
+default style (two space indentation, eighty column lines, double quotes,
 semicolons and trailing commas).
 
 The layout decisions follow prettier's: the precedence-and-clarity
@@ -19,9 +19,13 @@ assignment layouts, the member chain layout, and the hugging of a final
 function argument.
 -/
 
-namespace Language.JavaScript.MiniAST
+namespace Language.TypeScript.MiniTsAST
 
+open Language.JavaScript
 open Language.JavaScript.Doc
+open Language.JavaScript.MiniAST
+  (encodeStringLiteral encodeStringLiteralQuoted encodeJSXText encodeJSXAttrString
+    encodeJSXAttrStringQuoted encodeTemplateText)
 
 namespace Printer
 
@@ -51,6 +55,25 @@ def parenIf (cond : Bool) (d : Doc) : Doc := if cond then parens d else d
 /-- The terminator of a statement: a semicolon, or nothing under
 `semi: false`. -/
 def semiDoc : Doc := t Options.semiText
+
+/-- The break just inside the braces of an object type: a space while the
+type stands on one line, and nothing at all under `bracketSpacing:
+false`. -/
+def braceLine : Doc := if Options.bracketSpacing then .line else .softline
+
+/-- The separator between two members of an object type: a semicolon,
+which under `semi: false` prettier writes only while the type stands on
+one line, where the members would otherwise run together. -/
+def tsMemberSep : Doc := if Options.semi then t ";" else .ifBreak .nil (t ";")
+
+/-- The separator between two members of an object type that is written
+over several lines: nothing under `semi: false`. -/
+def tsBrokenMemberSep : Doc := if Options.semi then t ";" else .nil
+
+/-- The semicolon after the last member of an object type, written only
+where the type is broken over several lines, and not at all under
+`semi: false`. -/
+def tsMemberTrailer : Doc := if Options.semi then .ifBreak (t ";") .nil else .nil
 
 /-- A string literal, quoted the way `singleQuote` asks for. -/
 def strLit (s : String) : String := encodeStringLiteralQuoted Options.preferredQuote s
@@ -270,8 +293,24 @@ inductive Pos where
   | callee (extra : Bool) (parentArgs : Nat)
   /-- The `extends` clause of a class. -/
   | classHeritage
+  /-- The expression of an `as` or of a `satisfies`.  `extra` says that
+  the `as` itself stands where prettier indents what it holds inside the
+  parentheses it needs: on the right of an assignment or of a declarator,
+  or as the argument of `return`, `throw`, `await`, `yield` or a unary
+  operator. -/
+  | tsTypeOperand (extra : Bool)
+  /-- The expression of a `!`, or the one an instantiation `f<T>` reads
+  at a type.  `extra` says that the `!` itself stands where prettier
+  indents what it holds inside the parentheses it needs: on the right of
+  an assignment or of a declarator, or as the argument of `return`,
+  `throw`, `await`, `yield` or a unary operator. -/
+  | tsNonNullArg (extra : Bool)
   /-- An operand of a binary or logical operator. -/
   | binOperand (op : BinOp) (isLeft : Bool)
+  /-- What a TypeScript export assignment exports, `export = expr;`.  It
+  takes the parentheses an argument takes, and a JSX element written here
+  keeps parentheses of its own, unlike one exported by default. -/
+  | tsExportAssign
   /-- Any other position; parentheses as for an argument. -/
   | generic
 deriving BEq, Inhabited
@@ -284,11 +323,12 @@ def Pos.minPrec : Pos → Nat
   | .callArg | .testCallArg | .hugArg .. | .assignRhs .. | .propValue .. | .arrowBody
   | .yieldArg
   | .hugArrowBody | .spreadArg | .jsxSpreadChildArg | .ternaryBranch ..
-  | .ternaryAlternate .. | .generic => 1
+  | .ternaryAlternate .. | .tsExportAssign | .generic => 1
   | .ternaryTest .. => 3
   | .unaryArg | .awaitArg => 14
+  | .tsTypeOperand .. => 10
   | .memberObject .. | .assignTarget | .templateTag | .callee .. | .newCallee
-  | .classHeritage | .decorator => 16
+  | .classHeritage | .tsNonNullArg .. | .decorator => 16
   | .binOperand op _ => 2 + binOpPrec op
 
 /-- The precedence of an expression, from 0 for the comma operator to 17
@@ -298,12 +338,13 @@ def exprPrec : MiniExpr → Nat
   | .assign .. | .assignPattern .. | .arrow .. | .yield _ | .yieldFrom _ | .spread _ => 1
   | .ternary .. => 2
   | .binary _ op _ => 2 + binOpPrec op
+  | .asExpr .. | .satisfies .. => 10
   | .unary .. | .await _ => 14
   | .postfix .. => 15
   | .call .. | .dot .. | .privateDot .. | .index .. | .new .. | .chain ..
-  | .importCall .. => 16
+  | .importCall .. | .nonNull _ | .instantiation .. => 16
   | .superDot .. | .superIndex .. | .superCall .. => 16
-  | .template (some _) _ _ => 16
+  | .template (some _) _ _ _ => 16
   | _ => 17
 
 /-- Whether a binary operand needs parentheses inside a binary parent. -/
@@ -385,6 +426,15 @@ def jsxNoWrapPos : Pos → Bool
   | .callee .. | .newCallee => true
   | _ => false
 
+/-- Whether a chain holds a link written with `?.`.  A chain whose links
+are all `!`, `.` and calls is an ordinary member expression, which asks
+for no parentheses of its own. -/
+def chainIsOptional (links : NEList MiniChainLink) : Bool :=
+  links.toList.any fun link =>
+    match link with
+    | .dot o _ | .privateDot o _ | .index o _ | .call o _ _ => o
+    | .nonNull => false
+
 /-- Whether the expression has to be parenthesised in this position. -/
 def needsParens (pos0 : Pos) (e : MiniExpr) : Bool :=
   let pos := pos0.forParens
@@ -393,6 +443,7 @@ def needsParens (pos0 : Pos) (e : MiniExpr) : Bool :=
       match pos with
       | .binOperand pop isLeft => binaryOperandParens pop op isLeft
       | .unaryArg | .awaitArg | .callee .. | .spreadArg | .memberObject ..
+      | .tsTypeOperand ..
       | .classHeritage => true
       | .ternaryTest .. | .ternaryBranch .. | .ternaryAlternate .. => op == .coalesce
       | _ => exprPrec e < pos.minPrec
@@ -402,12 +453,14 @@ def needsParens (pos0 : Pos) (e : MiniExpr) : Bool :=
       match pos with
       | .awaitArg => false
       | .unaryArg | .spreadArg | .memberObject .. | .callee ..
+      | .tsTypeOperand ..
       | .ternaryTest .. => true
       | .binOperand .. => true
       | _ => exprPrec e < pos.minPrec
   | .yield _ | .yieldFrom _ =>
       match pos with
       | .unaryArg | .awaitArg | .spreadArg | .memberObject .. | .callee ..
+      | .tsTypeOperand ..
       | .ternaryTest .. => true
       | .binOperand .. => true
       | _ => exprPrec e < pos.minPrec
@@ -441,6 +494,16 @@ def needsParens (pos0 : Pos) (e : MiniExpr) : Bool :=
         || (if Options.experimentalTernaries && (match pos with
               | .ternaryTest _ => true | _ => false) then false
             else exprPrec e < pos.minPrec)
+  -- `(a + b) as T`: prettier parenthesises an `as` or a `satisfies`
+  -- written as an operand of an operator, anywhere in a conditional,
+  -- and after a `...`, where the parentheses are not needed but say
+  -- what is read at the type
+  | .asExpr .. | .satisfies .. =>
+      match pos with
+      | .spreadArg | .jsxSpreadChildArg => true
+      | .ternaryTest .. | .ternaryBranch .. | .ternaryAlternate .. => true
+      | .binOperand .. => true
+      | _ => exprPrec e < pos.minPrec
   -- `(void a) in b`: a unary operand of `in` or of `instanceof` keeps its
   -- parentheses on the left of the operator
   -- an update written with `++` or `--` is not one of them
@@ -456,8 +519,20 @@ def needsParens (pos0 : Pos) (e : MiniExpr) : Bool :=
   -- `.`, which a `BigInt` literal, written with its `n`, does not
   | .number (.bigint ..) => exprPrec e < pos.minPrec
   | .number _ => isMemberObjectPos pos
-  -- `(a?.b).c` is not `a?.b.c`, so the parentheses have to stay
-  | .chain _ _ => isMemberObjectPos pos || isCalleePos pos
+  -- `(f<T>).x`: prettier keeps parentheses around an instantiation
+  -- expression read through a `.`, a `[]` or a `?.`, and writes none
+  -- anywhere else — not as the callee of a call or of a `new`, not
+  -- before a `!`, and not as an operand
+  | .instantiation .. =>
+      match pos0 with
+      | .memberObject .. | .decorator => true
+      | .templateTag => false
+      | _ => exprPrec e < pos.minPrec
+  -- `(a?.b).c` is not `a?.b.c`, so the parentheses have to stay; a chain
+  -- which holds no `?.` at all — `a.b!()` — is read as the member
+  -- expression it is, and keeps none
+  | .chain _ links =>
+      chainIsOptional links && (isMemberObjectPos pos || isCalleePos pos)
   | .jsx _ => jsxNeedsParens pos0
   -- `(function () {})()` and ``(function () {})`t` ``: a function
   -- expression keeps its parentheses as the callee of a call and as the
@@ -470,7 +545,7 @@ def needsParens (pos0 : Pos) (e : MiniExpr) : Bool :=
 Prettier breaks the parentheses such a class takes, so that the decorators
 stand on lines of their own inside them. -/
 def isDecoratedClass : MiniExpr → Bool
-  | .classExpr (_ :: _) _ _ _ => true
+  | .classExpr (_ :: _) _ _ _ _ _ => true
   | _ => false
 
 /-- The parentheses the expression `e` takes, given the document it prints
@@ -502,6 +577,16 @@ call, which are the places the parentheses come from; the callee of a
 `new` and the tag of a template literal are not among them. -/
 def awaitBreaksInParens : Pos → Bool
   | .memberObject .. | .callee .. => true
+  | _ => false
+
+/-- Whether prettier lets the parentheses an `as` or a `satisfies`
+expression takes here break, writing the expression on a line of its own
+inside them.  It does so where the parentheses come from reading the
+expression through a member access, calling it, or building it with
+`new`; the tag of a template literal, and an operand of an operator, keep
+theirs on the line. -/
+def tsTypeExprBreaksInParens : Pos → Bool
+  | .memberObject .. | .callee .. | .newCallee => true
   | _ => false
 
 /-- Whether the position is the test, the consequent or the alternate of a
@@ -579,11 +664,20 @@ def cannotStartStatement : MiniExpr → Bool
 
 /-- Whether the link of an optional chain is written with `?.`. -/
 def chainLinkIsOptional : MiniChainLink → Bool
-  | .dot o _ | .privateDot o _ | .index o _ | .call o _ => o
+  | .dot o _ | .privateDot o _ | .index o _ => o
+  | .call o _ _ => o
+  | .nonNull => false
 
 /-- Whether the link of an optional chain is a call. -/
 def chainLinkIsCall : MiniChainLink → Bool
   | .call .. => true
+  | _ => false
+
+/-- Whether every link is a `!`, so that the link in front of them is the
+last one that is not. -/
+def linksAllNonNull : List MiniChainLink → Bool
+  | [] => true
+  | .nonNull :: rest => linksAllNonNull rest
   | _ => false
 
 /-- Whether an optional chain used as the base of another one merges into
@@ -612,8 +706,10 @@ def startsWithFunctionOrClassAt (merged : Bool) (pos : Pos) (e : MiniExpr) : Boo
     | .postfix l _ => startsWithFunctionOrClassAt false .unaryArg l
     | .dot o _ | .privateDot o _ | .index o _ =>
         startsWithFunctionOrClassAt false (.memberObject false false false) o
-    | .template (some tag) _ _ => startsWithFunctionOrClassAt false .templateTag tag
-    | .call callee _ => startsWithFunctionOrClassAt false (.callee false 0) callee
+    | .template (some tag) _ _ _ => startsWithFunctionOrClassAt false .templateTag tag
+    | .call callee _ _ => startsWithFunctionOrClassAt false (.callee false 0) callee
+    | .asExpr o _ | .satisfies o _ => startsWithFunctionOrClassAt false (.tsTypeOperand false) o
+    | .nonNull o => startsWithFunctionOrClassAt false (.tsNonNullArg false) o
     | .chain base links =>
         -- the base of a chain stands in parentheses unless the first link
         -- of the chain is optional, which merges the two
@@ -780,12 +876,12 @@ def isSimpleCallArgument : Nat → MiniExpr → Bool
     | .number _ | .string _ | .null | .true_ | .false_ => true
     | .ident _ | .this | .privateName _ => true
     -- a tagged template is not one of them
-    | .template none head parts =>
+    | .template none _ head parts =>
         !head.contains '\n' && simpleTemplateParts d parts
     | .object props => simpleProps d props
     | .array els => simpleElements d els
-    | .call f args => isSimpleCallArgument (d + 1) f && args.length ≤ d + 1 && simpleArgs d args
-    | .new f args => isSimpleCallArgument (d + 1) f && args.length ≤ d + 1 && simpleArgs d args
+    | .call f _ args => isSimpleCallArgument (d + 1) f && args.length ≤ d + 1 && simpleArgs d args
+    | .new f _ args => isSimpleCallArgument (d + 1) f && args.length ≤ d + 1 && simpleArgs d args
     | .dot o _ => isSimpleCallArgument (d + 1) o
     | .privateDot o _ => isSimpleCallArgument (d + 1) o
     | .index o i => isSimpleCallArgument (d + 1) o && isSimpleCallArgument (d + 1) i
@@ -794,6 +890,8 @@ def isSimpleCallArgument : Nat → MiniExpr → Bool
           || op == .preIncr || op == .preDecr)
           && isSimpleCallArgument (d + 1) a
     | .postfix a _ => isSimpleCallArgument (d + 1) a
+    -- a `!` is read through: `a!.b()` is as simple as `a.b()`
+    | .nonNull a => isSimpleCallArgument (d + 1) a
     | .chain base ⟨hd, tl⟩ =>
         isSimpleCallArgument (d + 1) base && simpleChainLink d hd && simpleChainLinks d tl
     -- a dynamic `import()` is call-like, but has no callee to look at
@@ -823,9 +921,9 @@ where
     | ⟨e, suffix⟩ :: rest =>
         isSimpleCallArgument d e && !suffix.contains '\n' && simpleTemplateParts d rest
   simpleChainLink (d : Nat) : MiniChainLink → Bool
-    | .dot .. | .privateDot .. => true
+    | .dot .. | .privateDot .. | .nonNull => true
     | .index _ i => isSimpleCallArgument (d + 1) i
-    | .call _ args => args.length ≤ d + 1 && simpleArgs d args
+    | .call _ _ args => args.length ≤ d + 1 && simpleArgs d args
   simpleChainLinks (d : Nat) : List MiniChainLink → Bool
     | [] => true
     | l :: rest => simpleChainLink d l && simpleChainLinks d rest
@@ -859,9 +957,9 @@ def isLoneShortArgument : MiniExpr → Bool
   | .regex r => r.source.val.length ≤ shortArgWidth
   -- a template literal of no substitution, whose text is short and stands
   -- on one line
-  | .template none head [] =>
+  | .template none _ head [] =>
       (encodeTemplateText head).length ≤ shortArgWidth && !head.contains '\n'
-  | .call (.ident n) [] => n.val.length + 2 ≤ shortArgWidth
+  | .call (.ident n) _ [] => n.val.length + 2 ≤ shortArgWidth
   | e => isLiteralExpr e
 
 /-- Whether the arguments of a call let the call keep its line: there are
@@ -871,13 +969,25 @@ def argumentsAreShort : List MiniExpr → Bool
   | [a] => isLoneShortArgument a
   | _ => false
 
+/-- Whether the type arguments of a call are complex ones, which prettier
+counts as breakable however short the call is: there is more than one of
+them, or the one there is is a union, an intersection or an object
+type. -/
+def tsTypeArgsAreComplex : List MiniTsType → Bool
+  | [] => false
+  | [ty] =>
+      match ty with
+      | .union _ | .intersection _ | .objectType _ => true
+      | _ => false
+  | _ => true
+
 /-- Whether the links of an optional chain, outermost first, make a chain
 prettier considers poorly breakable.  `baseOk` says whether the base of
 the chain is one. -/
 def linksArePoorlyBreakable (baseOk : Bool) : List MiniChainLink → Bool
   | [] => baseOk
-  | .call _ args :: rest =>
-      argumentsAreShort args
+  | .call _ targs args :: rest =>
+      argumentsAreShort args && !tsTypeArgsAreComplex targs
         && (match rest with
             -- the callee of the call is itself a call
             | .call .. :: _ => false
@@ -889,8 +999,12 @@ no argument, or one short argument. -/
 def isPoorlyBreakableChain : Bool → MiniExpr → Bool
   -- the callee is read through, whatever it is: a member access, a
   -- parenthesised optional chain, or a call of its own
-  | _, .call f args => argumentsAreShort args && isPoorlyBreakableChain true f
+  | _, .call f targs args =>
+      argumentsAreShort args && !tsTypeArgsAreComplex targs && isPoorlyBreakableChain true f
   | _, .dot o _ | _, .privateDot o _ | _, .index o _ => isPoorlyBreakableChain true o
+  -- a `!` is one of the links of the chain prettier reads, and is read
+  -- through here: `a.b!.c.d` is as poorly breakable as `a.b.c.d`
+  | deep, .nonNull o => isPoorlyBreakableChain deep o
   | _, .chain base ⟨hd, tl⟩ =>
       linksArePoorlyBreakable (isPoorlyBreakableChain true base) (hd :: tl).reverse
   | deep, .ident _ => deep
@@ -934,7 +1048,8 @@ def isSimpleNumberString (s : String) : Bool :=
 /-- Whether a property name has to keep its quotes: it is a string that is
 neither an identifier name nor the plain spelling of the number it
 denotes.  Under `quoteProps: "consistent"` one such name among the
-properties of an object, of a class or of a pattern quotes them all. -/
+properties of an object, of a class, of a type or of an enum quotes them
+all. -/
 def keyNeedsQuotes : MiniPropertyName → Bool
   | .string v => !isIdentifierName v && !isSimpleNumberString v
   | _ => false
@@ -948,7 +1063,7 @@ def quoteAllKeys (keys : List MiniPropertyName) : Bool :=
 /-- The names of the properties of an object literal. -/
 def propertyKeys : List MiniProperty → List MiniPropertyName
   | [] => []
-  | .keyValue k _ :: rest | .method _ k _ _ :: rest => k :: propertyKeys rest
+  | .keyValue k _ :: rest | .method _ k _ _ _ _ :: rest => k :: propertyKeys rest
   | _ :: rest => propertyKeys rest
 
 /-- Whether the properties of an object literal are all written quoted. -/
@@ -957,7 +1072,7 @@ def quoteAllProps (props : List MiniProperty) : Bool := quoteAllKeys (propertyKe
 /-- The names of the members of a class. -/
 def classElemKeys : List MiniClassElement → List MiniPropertyName
   | [] => []
-  | .method _ _ _ k _ _ :: rest | .field _ _ _ k _ :: rest => k :: classElemKeys rest
+  | .method _ _ _ k _ _ _ _ _ :: rest | .field _ _ _ k _ _ _ _ :: rest => k :: classElemKeys rest
   | _ :: rest => classElemKeys rest
 
 /-- Whether the members of a class are all written quoted. -/
@@ -973,12 +1088,32 @@ quoted. -/
 def quoteAllPatternKeys (props : List MiniObjectPatternProp) : Bool :=
   quoteAllKeys (objectPatternKeys props)
 
+/-- The names of the members of an interface or of an object type. -/
+def tsTypeMemberKeys : List MiniTsTypeMember → List MiniPropertyName
+  | [] => []
+  | .property _ k _ _ :: rest | .method _ k _ _ _ _ :: rest => k :: tsTypeMemberKeys rest
+  | _ :: rest => tsTypeMemberKeys rest
+
+/-- Whether the members of an interface or of an object type are all
+written quoted. -/
+def quoteAllTypeMembers (members : List MiniTsTypeMember) : Bool :=
+  quoteAllKeys (tsTypeMemberKeys members)
+
+/-- The names of the members of an enum. -/
+def tsEnumMemberKeys : List MiniTsEnumMember → List MiniPropertyName
+  | [] => []
+  | m :: rest => m.key :: tsEnumMemberKeys rest
+
+/-- Whether the members of an enum are all written quoted. -/
+def quoteAllEnumMembers (members : List MiniTsEnumMember) : Bool :=
+  quoteAllKeys (tsEnumMemberKeys members)
+
 /-! ## Semicolons -/
 
 /-- Whether the name is one of `static`, `get` and `set` written as a
-plain identifier: a field of that name and no value keeps its semicolon
-under `semi: false`, since the line that follows it would otherwise be
-read as its value. -/
+plain identifier: a field of that name, with neither a value nor a type
+annotation, keeps its semicolon under `semi: false`, since the line that
+follows it would otherwise be read as its value. -/
 def keyIsStaticGetSet : MiniPropertyName → Bool
   | .ident n => n.val == "static" || n.val == "get" || n.val == "set"
   | _ => false
@@ -994,18 +1129,29 @@ def keyIsComputed : MiniPropertyName → Bool
   | .computed _ => true
   | _ => false
 
+/-- Whether the modifiers of a member make prettier leave the field in
+front of it without its semicolon: a member written `static`, `readonly`
+or with an accessibility modifier is one prettier never reads a field
+on into. -/
+def modsStopReading (m : TsMemberMods) : Bool :=
+  m.isStatic || m.isReadonly || m.accessibility.isSome
+
 /-- Under `semi: false`, whether the member written after a field would be
 read as part of that field, so that the field keeps its semicolon: it is
 prettier's `shouldPrintSemicolonAfterClassProperty`. -/
 def memberFollowsField : Option MiniClassElement → Bool
   | none => false
   | some (.staticBlock _) => false
+  -- an index signature begins with a `[`, which a field is read on
+  -- into, just as a computed name is
+  | some (.indexSig mods ..) => !modsStopReading mods
   -- an `accessor` field is not one prettier reads a computed name as
   -- the continuation of: only the `in` and `instanceof` rule applies
-  | some (.field _ isStatic isAccessor key _) =>
-      !isStatic && (keyIsInOrInstanceof key || (!isAccessor && keyIsComputed key))
-  | some (.method _ isStatic kind key _ _) =>
-      !isStatic
+  | some (.field _ mods isAccessor key ..) =>
+      !modsStopReading mods
+        && (keyIsInOrInstanceof key || (!isAccessor && keyIsComputed key))
+  | some (.method _ mods kind key ..) =>
+      !modsStopReading mods
         && (keyIsInOrInstanceof key
             || (match kind with
                 | .get | .set | .async | .asyncGenerator => false
@@ -1014,12 +1160,25 @@ def memberFollowsField : Option MiniClassElement → Bool
 
 /-- The semicolon written after a class field: always under `semi: true`,
 and under `semi: false` only where a parser would otherwise read on. -/
-def fieldSemiDoc (key : MiniPropertyName) (init : Option MiniExpr)
-    (next : Option MiniClassElement) : Doc :=
+def fieldSemiDoc (key : MiniPropertyName) (type : Option MiniTsType)
+    (init : Option MiniExpr) (next : Option MiniClassElement) : Doc :=
   if Options.semi then t ";"
-  else if init.isNone && keyIsStaticGetSet key then t ";"
+  else if init.isNone && type.isNone && keyIsStaticGetSet key then t ";"
   else if memberFollowsField next then t ";"
   else .nil
+
+/-- Whether the parameters of an arrow function are written without their
+parentheses: `arrowParens: "avoid"`, and one parameter which is a plain
+name -- not a rest element, a pattern, a name with a default value, an
+optional one or one that carries a type annotation, a decorator or a
+modifier.  An arrow that is written with type parameters or with a return
+type keeps its parentheses whatever its parameter is. -/
+def arrowParensAvoided (typeParams : List MiniTsTypeParam) (params : List MiniParam)
+    (retType : Option MiniTsType) : Bool :=
+  Options.arrowParens == .avoid && typeParams.isEmpty && retType.isNone &&
+    match params with
+    | [.plain decorators mods (.ident _) false none] => decorators.isEmpty && mods.isEmpty
+    | _ => false
 
 /-- Whether a character is one a parser reads as the continuation of the
 statement before it, so that a statement beginning with it takes a
@@ -1034,11 +1193,42 @@ def startsWithPrefixUpdate : MiniExpr → Bool
   | .unary .preIncr _ | .unary .preDecr _ => true
   | .binary l _ _ | .seq l _ | .assign l _ _ => startsWithPrefixUpdate l
   | .dot o _ | .privateDot o _ | .index o _ | .chain o _ => startsWithPrefixUpdate o
-  | .call f _ => startsWithPrefixUpdate f
-  | .postfix e _ => startsWithPrefixUpdate e
-  | .ternary c _ _ => startsWithPrefixUpdate c
-  | .template (some tag) _ _ => startsWithPrefixUpdate tag
+  | .asExpr e _ | .satisfies e _ | .nonNull e | .instantiation e _ => startsWithPrefixUpdate e
   | _ => false
+
+/-- Whether the leftmost token of the expression is that of an arrow
+function whose parameters prettier writes between parentheses.  Such a
+statement is one prettier guards under `semi: false`, even where the
+arrow is written `async` first and so does not itself begin with `(`. -/
+def startsWithParenArrow : MiniExpr → Bool
+  | .arrow _ typeParams params retType _ => !arrowParensAvoided typeParams params retType
+  | .binary l _ _ | .seq l _ | .assign l _ _ => startsWithParenArrow l
+  | .dot o _ | .privateDot o _ | .index o _ | .chain o _ => startsWithParenArrow o
+  | .call f _ _ => startsWithParenArrow f
+  | .postfix e _ => startsWithParenArrow e
+  | .ternary c _ _ => startsWithParenArrow c
+  | .template (some tag) _ _ _ => startsWithParenArrow tag
+  | .asExpr e _ | .satisfies e _ | .nonNull e | .instantiation e _ => startsWithParenArrow e
+  | _ => false
+
+/-- Under `semi: false`, the semicolon prettier writes in front of an
+expression statement of a statement list whose first token would
+otherwise continue the statement before it. -/
+def asiGuard (s : MiniStatement) (d : Doc) : Doc :=
+  if Options.semi then d
+  else
+    match s with
+    | .expr e =>
+        if startsWithParenArrow e then t ";" ++ d
+        else
+          match Doc.firstFlatChar d with
+          | some c =>
+              if isASIHazardChar c
+                  && !((c == '+' || c == '-') && startsWithPrefixUpdate e) then
+                t ";" ++ d
+              else d
+          | none => d
+    | _ => d
 
 /-! ## Layout helpers -/
 
@@ -1133,65 +1323,39 @@ def argumentsDocMaybeOpen (openArgs : Bool) :
     Bool → Bool → Bool → Bool → List Doc → List Doc → List Doc → Doc :=
   argumentsDocOf .all openArgs
 
+/-- Whether a parameter is one prettier writes out between the
+parentheses of the function, as in `function ({\n  a,\n}) {}`: it
+destructures an object or an array, possibly with a plain default value.
+It is hugged only when it is the one parameter of the function. -/
+def shouldHugParameter (p : MiniPattern) (type : Option MiniTsType) : Bool :=
+  let rec destructures : MiniPattern → Bool
+    | .object .. | .array .. => true
+    | _ => false
+  -- an identifier whose type annotation is an object type is hugged too
+  let objectTyped :=
+    (match p with | .ident _ => true | _ => false) &&
+      (match type with
+        | some (.objectType _) => true
+        | some (.mapped ..) => true
+        | _ => false)
+  objectTyped ||
+  match p with
+  | .withDefault q v =>
+      destructures q &&
+        (match v with
+          | .ident _ => true
+          | .object [] => true
+          | .array [] => true
+          | _ => false)
+  | q => destructures q
+
 /-- Whether the only parameter of a function is one prettier writes out
-between the parentheses of the function, as in `function ({\n  a,\n}) {}`:
-it destructures an object or an array, possibly with a plain default
-value. -/
+between the parentheses of the function.  A parameter property, which is
+written with modifiers of its own, is never hugged: its parameter list
+stands open instead. -/
 def shouldHugTheOnlyParameter : List MiniParam → Bool
-  | [.plain p] =>
-      let rec destructures : MiniPattern → Bool
-        | .object .. | .array .. => true
-        | _ => false
-      match p with
-      | .withDefault q v =>
-          destructures q &&
-            (match v with
-              | .ident _ => true
-              | .object [] => true
-              | .array [] => true
-              | _ => false)
-      | q => destructures q
+  | [.plain [] mods p _ type] => mods.isEmpty && shouldHugParameter p type
   | _ => false
-
-/-- Whether the parameters of an arrow function are written without their
-parentheses: `arrowParens: "avoid"`, and one parameter which is a plain
-name -- not a rest element, a pattern or a name with a default value. -/
-def arrowParensAvoided : List MiniParam → Bool
-  | [.plain (.ident _)] => Options.arrowParens == .avoid
-  | _ => false
-
-/-- Whether the leftmost token of the expression is that of an arrow
-function whose parameters prettier writes between parentheses.  Such a
-statement is one prettier guards under `semi: false`, even where the
-arrow is written `async` first and so does not itself begin with `(`. -/
-def startsWithParenArrow : MiniExpr → Bool
-  | .arrow _ params _ => !arrowParensAvoided params
-  | .binary l _ _ | .seq l _ | .assign l _ _ => startsWithParenArrow l
-  | .dot o _ | .privateDot o _ | .index o _ | .chain o _ => startsWithParenArrow o
-  | .call f _ => startsWithParenArrow f
-  | .postfix e _ => startsWithParenArrow e
-  | .ternary c _ _ => startsWithParenArrow c
-  | .template (some tag) _ _ => startsWithParenArrow tag
-  | _ => false
-
-/-- Under `semi: false`, the semicolon prettier writes in front of an
-expression statement of a statement list whose first token would
-otherwise continue the statement before it. -/
-def asiGuard (s : MiniStatement) (d : Doc) : Doc :=
-  if Options.semi then d
-  else
-    match s with
-    | .expr e =>
-        if startsWithParenArrow e then t ";" ++ d
-        else
-          match Doc.firstFlatChar d with
-          | some c =>
-              if isASIHazardChar c
-                  && !((c == '+' || c == '-') && startsWithPrefixUpdate e) then
-                t ";" ++ d
-              else d
-          | none => d
-    | _ => d
 
 /-- A parameter list.  `hug` says that the list is the one object or array
 pattern prettier writes out between the parentheses of the function. -/
@@ -1226,6 +1390,9 @@ def clauseDoc (isBlock isEmptyStatement : Bool) (d : Doc) : Doc :=
 /-- What one element of a member chain is. -/
 inductive ChainKind where
   | base | dot | index | call
+  /-- The `!` of a non-null assertion written on an element of the chain,
+  which prettier reads as an element of its own. -/
+  | nonNull
 deriving BEq, Inhabited
 
 /-- One element of a member chain, together with what the layout
@@ -1256,6 +1423,58 @@ deriving Inhabited
 /-- Whether the element continues a member chain, rather than ending it. -/
 def ChainItem.isMemberish (i : ChainItem) : Bool := i.kind == .dot || i.kind == .index
 
+/-- The `!` of a non-null assertion, as an element of a chain. -/
+def nonNullItem : ChainItem := { kind := .nonNull, doc := Doc.text "!" }
+
+/-- The index, if there is one, of the last call of the chain whose callee
+carries a `!`, that is, of the last call written right after a `!`. -/
+def lastNonNullCall (items : List ChainItem) : Option Nat :=
+  let rec go (idx : Nat) (prevNonNull : Bool) (found : Option Nat) :
+      List ChainItem → Option Nat
+    | [] => found
+    | i :: rest =>
+        go (idx + 1) (i.kind == .nonNull)
+          (if prevNonNull && i.kind == .call then some idx else found) rest
+  go 0 false none items
+
+/-- The head of a chain that is collapsed at a call written on a `!`,
+written as the ordinary expression printer writes it: a name access reads
+through an identifier on the line it stands on, and every other one may
+take a line of its own. -/
+def nonNullHeadDoc : List ChainItem → Doc
+  | [] => .nil
+  | base :: rest => go base.doc (base.identName != "") false rest
+where
+  go (acc : Doc) (objIsIdent seenCall : Bool) : List ChainItem → Doc
+    | [] => acc
+    | i :: rest =>
+        if i.kind == .dot then
+          let inline := objIsIdent && !seenCall
+          go (acc ++ (if inline then i.doc
+                else .group (.nest indentWidth (.softline ++ i.doc)))) false seenCall rest
+        else go (acc ++ i.doc) false (seenCall || i.kind == .call) rest
+
+/-- Collapse the head of a chain at the last call written on a `!`.
+Prettier reads a member chain out of the outermost call whose callee is a
+member access: a call whose callee is a non-null assertion, `a.b!()`, is
+not one, so the chain starts above it and everything up to and including
+it is the head the chain is read from, written as it is written anywhere
+else. -/
+def collapseNonNullHead (items : List ChainItem) : List ChainItem :=
+  match lastNonNullCall items with
+  | none => items
+  | some k =>
+    let head := items.take (k + 1)
+    let rest := items.drop (k + 1)
+    if rest.isEmpty then items
+    else
+      match head.getLast? with
+      | none => items
+      | some call =>
+        { kind := .base, doc := nonNullHeadDoc head, isCallBase := true,
+          simpleArgs := call.simpleArgs, functionArg := call.functionArg,
+          hasArgs := call.hasArgs } :: rest
+
 /-- A `.` or `[]` access. -/
 def isMemberish : MiniExpr → Bool
   | .dot .. | .privateDot .. | .index .. => true
@@ -1266,14 +1485,14 @@ literal, so that the expression has to be parenthesised where a statement,
 or the body of an arrow function, may not start with one. -/
 def startsWithObjectLiteral : MiniExpr → Bool
   | .object _ => true
-  | .call (.func ..) _ => false
-  | .template (some (.func ..)) _ _ => false
+  | .call (.func ..) _ _ => false
+  | .template (some (.func ..)) _ _ _ => false
   | .binary l _ _ | .assign l _ _ | .seq l _ => startsWithObjectLiteral l
   | .dot o _ | .privateDot o _ | .index o _ | .chain o _ | .postfix o _ =>
       startsWithObjectLiteral o
-  | .call f _ => startsWithObjectLiteral f
+  | .call f _ _ => startsWithObjectLiteral f
   | .ternary c _ _ => startsWithObjectLiteral c
-  | .template (some tag) _ _ => startsWithObjectLiteral tag
+  | .template (some tag) _ _ _ => startsWithObjectLiteral tag
   | _ => false
 
 /-- A conditional expression that does not start with an object literal.
@@ -1313,8 +1532,8 @@ the consequent is a short expression.
 
 mutual
 
-/-- The number of nodes the babel syntax tree of the expression holds,
-counted the way prettier's `getNodeContentCount` counts them: the
+/-- The number of nodes the TypeScript syntax tree of the expression
+holds, counted the way prettier's `getNodeContentCount` counts them: the
 properties of a node which are nodes themselves, recursively, and not the
 ones which are lists of nodes. -/
 def babelNodeCount : MiniExpr → Nat
@@ -1331,28 +1550,38 @@ def babelNodeCount : MiniExpr → Nat
   | .superCall _ => 1
   | .assign l _ r => 2 + babelNodeCount l + babelNodeCount r
   | .assignPattern _ r => 2 + babelNodeCount r
-  | .await e | .unary _ e | .postfix e _ | .spread e | .yieldFrom e => 1 + babelNodeCount e
+  | .await e | .unary _ e | .postfix e _ | .spread e | .yieldFrom e | .nonNull e =>
+      1 + babelNodeCount e
   | .yield none => 0
   | .yield (some e) => 1 + babelNodeCount e
-  | .call f _ | .new f _ => 1 + babelNodeCount f
+  | .call f targs _ | .new f targs _ =>
+      1 + babelNodeCount f + (if targs.isEmpty then 0 else 1 + tsTypeListCount targs)
+  | .instantiation e targs => 1 + babelNodeCount e + (if targs.isEmpty then 0 else 1 + tsTypeListCount targs)
+  | .asExpr e ty | .satisfies e ty => 2 + babelNodeCount e + tsTypeCount ty
   | .importCall spec opts =>
       1 + babelNodeCount spec
         + (match opts with | some o => 1 + babelNodeCount o | none => 0)
   | .dot o _ | .privateDot o _ => 2 + babelNodeCount o
   | .index o i => 2 + babelNodeCount o + babelNodeCount i
-  | .chain b links => babelNodeCount b + babelChainLinksCount (links.hd :: links.tl)
-  | .classExpr _ name heritage _ =>
-      1 + (if name.isSome then 1 else 0)
-        + (match heritage with | some h => 1 + babelNodeCount h | none => 0)
-  | .func _ _ name _ _ => 1 + (if name.isSome then 1 else 0)
-  | .arrow _ _ body => 1 + (match body with | .expr e => babelNodeCount e | .block _ => 0)
+  -- an optional chain is read into a chain expression of its own
+  | .chain b links => 1 + babelNodeCount b + babelChainLinksCount (links.hd :: links.tl)
+  | .classExpr _ name typeParams heritage _ _ =>
+      1 + (if name.isSome then 1 else 0) + (if typeParams.isEmpty then 0 else 1)
+        + (match heritage with | some _ => 1 | none => 0)
+  | .func _ _ name typeParams _ ret _ =>
+      1 + (if name.isSome then 1 else 0) + (if typeParams.isEmpty then 0 else 1)
+        + (match ret with | some ty => 1 + tsTypeCount ty | none => 0)
+  | .arrow _ typeParams _ ret body =>
+      1 + (if typeParams.isEmpty then 0 else 1)
+        + (match ret with | some ty => 1 + tsTypeCount ty | none => 0)
+        + (match body with | .expr e => babelNodeCount e | .block _ => 0)
   | .binary l _ r => 2 + babelNodeCount l + babelNodeCount r
   | .ternary c a b => 3 + babelNodeCount c + babelNodeCount a + babelNodeCount b
-  | .template none _ _ => 0
-  | .template (some tag) _ _ => 2 + babelNodeCount tag
+  | .template none _ _ _ => 0
+  | .template (some tag) targs _ _ => 2 + babelNodeCount tag + (if targs.isEmpty then 0 else 1 + tsTypeListCount targs)
   -- an element holds its opening element, and its closing one where it
   -- has children; each of them holds its name
-  | .jsx (.element _ _ children) => if children.isSome then 4 else 2
+  | .jsx (.element _ _ _ children) => if children.isSome then 4 else 2
   | .jsx (.fragment _) => 2
 termination_by e => sizeOf e
 decreasing_by
@@ -1367,9 +1596,50 @@ def babelChainLinksCount : List MiniChainLink → Nat
       (match l with
         | .dot _ _ | .privateDot _ _ => 2
         | .index _ i => 2 + babelNodeCount i
-        | .call _ _ => 1)
+        | .call _ targs _ => 1 + (if targs.isEmpty then 0 else 1 + tsTypeListCount targs)
+        | .nonNull => 1)
       + babelChainLinksCount rest
 termination_by ls => sizeOf ls
+
+/-- The nodes the types of a list hold. -/
+def tsTypeListCount : List MiniTsType → Nat
+  | [] => 0
+  | ty :: rest => tsTypeCount ty + tsTypeListCount rest
+termination_by ls => sizeOf ls
+
+/-- The nodes a type holds, counted as the nodes of an expression are. -/
+def tsTypeCount : MiniTsType → Nat
+  | .ref name args => tsEntityNameCount name + (if args.isEmpty then 0 else 1 + tsTypeListCount args)
+  | .this | .uniqueSymbol => 0
+  | .strLit _ | .numLit _ => 1
+  | .negNumLit _ => 2
+  | .array e | .keyof e | .readonlyOp e => 1 + tsTypeCount e
+  | .indexed o i => 2 + tsTypeCount o + tsTypeCount i
+  | .union _ | .intersection _ | .objectType _ | .tuple _ | .templateLit _ _ => 0
+  | .fn typeParams _ ret =>
+      1 + tsTypeCount ret + (if typeParams.isEmpty then 0 else 1)
+  | .ctor _ typeParams _ ret =>
+      1 + tsTypeCount ret + (if typeParams.isEmpty then 0 else 1)
+  | .typeQuery name args => tsEntityNameCount name + (if args.isEmpty then 0 else 1 + tsTypeListCount args)
+  | .infer_ _ constraint =>
+      1 + 1 + (match constraint with | some c => tsTypeCount c | none => 0)
+  | .conditional c e a b => 4 + tsTypeCount c + tsTypeCount e + tsTypeCount a + tsTypeCount b
+  | .mapped _ _ constraint as_ _ value =>
+      2 + tsTypeCount constraint
+        + (match as_ with | some ty => tsTypeCount ty | none => 0)
+        + (match value with | some ty => tsTypeCount ty | none => 0)
+  | .importType _ _ _ qualifier args =>
+      1 + (match qualifier with | some n => tsEntityNameCount n | none => 0)
+        + (if args.isEmpty then 0 else 1 + tsTypeListCount args)
+  | .predicate _ _ ty =>
+      1 + (match ty with | some t => 1 + tsTypeCount t | none => 0)
+termination_by ty => sizeOf ty
+
+/-- The nodes a qualified name holds: one for each name of it. -/
+def tsEntityNameCount : TsEntityName → Nat
+  | .ident _ => 1
+  | .qualified left _ => 2 + tsEntityNameCount left
+termination_by n => sizeOf n
 
 end
 
@@ -1389,12 +1659,12 @@ def isShortExpr : MiniExpr → Bool
   | .unary .plus (.number _) | .unary .minus (.number _) => true
   | .regex r => 4 * r.source.val.length ≤ Options.printWidth
   | .string v => 4 * (strLit v).length ≤ Options.printWidth
-  | .template none head [] =>
+  | .template none [] head [] =>
       4 * head.length ≤ Options.printWidth && !head.contains '\n'
   -- `++x` and `--x` are updates, not unary operators, and are not short
   | .unary .preIncr _ | .unary .preDecr _ => false
   | .unary _ e => isShortExpr e
-  | .call (.ident n) [] => 4 * n.val.length + 8 ≤ Options.printWidth
+  | .call (.ident n) [] [] => 4 * n.val.length + 8 ≤ Options.printWidth
   | e => isLiteralExpr e
 
 /-- Whether the expression is `null` or `undefined`.  A branch of a
@@ -1417,7 +1687,7 @@ def keepsArrowBodyOnLine (breakChain : Bool) : MiniExpr → Bool
 the end of the chain. -/
 def arrowChainParts (params : List MiniParam) :
     MiniArrowBody → List (List MiniParam) × MiniArrowBody
-  | .expr (.arrow _ ps b) =>
+  | .expr (.arrow _ _ ps _ b) =>
       let (rest, body) := arrowChainParts ps b
       (params :: rest, body)
   | b => ([params], b)
@@ -1425,7 +1695,8 @@ def arrowChainParts (params : List MiniParam) :
 /-- Whether the parameter is a plain identifier.  Prettier always breaks a
 chain of arrow functions one of whose parameters is not one. -/
 def paramIsPlainIdent : MiniParam → Bool
-  | .plain (.ident _) => true
+  | .plain [] mods (.ident _) isOptional type =>
+      mods.isEmpty && !isOptional && type.isNone
   | _ => false
 
 /-- Whether prettier keeps the body of a chain of arrow functions on the
@@ -1529,7 +1800,7 @@ def arrowLayoutOf (pos : Pos) (breakChain bodyOnSameLine : Bool)
 /-- Whether the node is part of the spine of a member chain. -/
 def isChainNode : MiniExpr → Bool
   | .dot .. | .privateDot .. | .index .. => true
-  | .call f _ => isChainNode f
+  | .call f _ _ => isChainNode f
   | _ => false
 
 /-- Whether the node is one whose elements a member chain is made of,
@@ -1538,8 +1809,24 @@ only when its callee does: `f().a.b` starts from the whole `f()`, whereas
 `a.b().c` starts from `a`. -/
 def isChainSpine : MiniExpr → Bool
   | .dot .. | .privateDot .. | .index .. | .chain .. => true
-  | .call f _ => isChainNode f || (match f with | .call .. => true | _ => false)
+  | .call f _ _ => isChainNode f || (match f with | .call .. => true | _ => false)
   | _ => false
+
+/-- Whether the chain reads through the node when it stands as the object
+of an access, or as the base of an optional chain.  A `!` is an element of
+the chain, so the chain goes on into the expression it is written on; a
+call whose callee is a `!` is not, which is what makes the chain start
+above such a call. -/
+def isChainNodeObject : MiniExpr → Bool
+  | .nonNull _ => true
+  | e => isChainNode e
+
+/-- Whether the chain reads through the node when it stands as the object
+of an access: as `isChainNodeObject`, for the elements that carry their
+documents. -/
+def isChainSpineObject : MiniExpr → Bool
+  | .nonNull _ => true
+  | e => isChainSpine e
 
 /-- Whether the node is read through by the member chain layout: a member
 access is, and so is a call whose callee is a member access or a call
@@ -1547,8 +1834,14 @@ itself, which is how prettier takes a curried call, `f(a, b)(c)`, into the
 chain that holds it. -/
 def isChainSpineNode : MiniExpr → Bool
   | .dot .. | .privateDot .. | .index .. => true
-  | .call f _ => isMemberish f || isCallLikeExpr f
+  | .call f _ _ => isMemberish f || isCallLikeExpr f
   | _ => false
+
+/-- Whether the chain reads through the node when it stands as the object
+of an access: as `isChainSpineNode`, and a `!` as well. -/
+def isChainSpineNodeObject : MiniExpr → Bool
+  | .nonNull _ => true
+  | e => isChainSpineNode e
 
 /-- Split the elements of a chain into the groups prettier lays out, one
 per line when the chain breaks. -/
@@ -1562,11 +1855,11 @@ private def chainGroups (baseIsCall : Bool) : List ChainItem → List (List Chai
         (first ++ more, rest)
     first :: laterGroups false [] rest
 where
-  /-- As many calls, and numeric index accesses, as there are. -/
+  /-- As many calls, `!`s, and numeric index accesses, as there are. -/
   takeFirst : List ChainItem → List ChainItem × List ChainItem
     | [] => ([], [])
     | i :: rest =>
-        if i.kind == .call || (i.kind == .index && i.numericIndex) then
+        if i.kind == .call || i.kind == .nonNull || (i.kind == .index && i.numericIndex) then
           let (taken, rest) := takeFirst rest
           (i :: taken, rest)
         else ([], i :: rest)
@@ -1616,7 +1909,7 @@ rather than simply writing them one after the other: it does so when more
 than one group is left once the head, and the group merged into it, are
 taken away. -/
 def chainItemsAreMemberChain (isStatement : Bool) (items : List ChainItem) : Bool :=
-  match items with
+  match collapseNonNullHead items with
   | [] => false
   | base :: links =>
     let groups := chainGroups base.isCallBase links
@@ -1630,7 +1923,7 @@ is a link of a long curried chain, `a.f(x, y)(z)`: prettier then leaves a
 chain short enough to be written on one line ungrouped, so that it breaks
 with the call that holds it. -/
 def memberChainDoc (isStatement curried : Bool) (items : List ChainItem) : Doc :=
-  match items with
+  match collapseNonNullHead items with
   | [] => .nil
   | base :: links =>
     let groups := chainGroups base.isCallBase links
@@ -1669,27 +1962,43 @@ def memberChainDoc (isStatement curried : Bool) (items : List ChainItem) : Doc :
           ++ .condGroup oneLine expanded
 
 /-- Whether the expression is a call with at least one argument; the call
-at the end of an optional chain counts. -/
+at the end of an optional chain counts, and so does one under a non-null
+assertion, which prettier reads through when it looks for what holds a
+member access. -/
 def isCallWithArgs : MiniExpr → Bool
-  | .call _ args => !args.isEmpty
+  | .call _ _ args => !args.isEmpty
+  | .nonNull e => isCallWithArgs e
   | .chain _ links =>
       match (links.hd :: links.tl).getLast? with
-      | some (.call _ args) => !args.isEmpty
+      | some (.call _ _ args) => !args.isEmpty
       | _ => false
   | _ => false
 
 /-- Whether prettier keeps a member access on the line of its object,
-rather than letting the line break in front of the access, given what the
-object of the access is.  `objIsChain` says that the object is laid out as
-a member chain, which the access of an assigned chain keeps its line
-for. -/
+rather than letting the line break in front of the access, as far as the
+rules it reads off the access itself and off what stands immediately
+around it go, given what the object of the access is.  `objIsChain` says
+that the object is laid out as a member chain, which the access of an
+assigned chain keeps its line for.  These are the rules that hold of an
+access written inside an optional chain as well. -/
+def memberInlinesInChain (pos : Pos)
+    (objIsIdent objIsCallWithArgs objIsChain propIsIdent : Bool) : Bool :=
+  (propIsIdent && objIsIdent && !isMemberObjectPos pos)
+    || ((isAssignRhsPos pos || pos == .assignTarget) && (objIsCallWithArgs || objIsChain))
+
+/-- Whether prettier keeps a member access on the line of its object,
+rather than letting the line break in front of the access.  This is
+`memberInlinesInChain` together with the rules prettier reads off what
+holds the whole chain of accesses the access belongs to: those are the
+ones an optional chain hides, since prettier reads such a chain into a
+chain expression of its own, which stands between the accesses and what
+holds them. -/
 def memberInlines (pos : Pos) (objIsIdent objIsCallWithArgs objIsChain propIsIdent : Bool) :
     Bool :=
   pos == .newCallee
     -- the chain is assigned to something other than a plain identifier
     || inlineMemberRoot pos
-    || (propIsIdent && objIsIdent && !isMemberObjectPos pos)
-    || ((isAssignRhsPos pos || pos == .assignTarget) && (objIsCallWithArgs || objIsChain))
+    || memberInlinesInChain pos objIsIdent objIsCallWithArgs objIsChain propIsIdent
 
 /-- A member access, given the documents of its object and of the access
 itself. -/
@@ -1714,12 +2023,16 @@ the base is the callee of the first link when that link is a call, and
 the object of a member access otherwise. -/
 def chainBasePos (pos : Pos) (links : NEList MiniChainLink) : Pos :=
   match links.hd with
-  | .call _ args => calleePos pos args.length
+  | .call _ _ args => calleePos pos args.length
   | _ =>
       -- a call among the links stands between the base and whatever holds
       -- the chain: the accesses inside the base then take a line of their
-      -- own, whatever the chain is written in
-      if links.toList.any chainLinkIsCall then
+      -- own, whatever the chain is written in.  An optional chain is read
+      -- into a chain expression of its own, which stands between the
+      -- accesses of the chain and whatever holds it, so those accesses do
+      -- not keep the line of their object for the sake of an assignment
+      -- outside the chain either.
+      if links.toList.any chainLinkIsCall || chainIsOptional links then
         .memberObject (chainStartsComputed links) (extraIndentRoot pos) false
       else memberObjectPos (chainStartsComputed links) pos
 
@@ -1729,10 +2042,10 @@ call, the base is a call of the chain that holds it. -/
 def chainBaseItem (e : MiniExpr) (d : Doc) : ChainItem :=
   let baseArgs : Option (List MiniExpr) :=
     match e with
-    | .call _ args => some args
+    | .call _ _ args => some args
     | .chain _ links =>
         (match links.toList.getLast? with
-          | some (.call _ args) => some args
+          | some (.call _ _ args) => some args
           | _ => none)
     | _ => none
   { kind := .base, doc := d,
@@ -1771,27 +2084,38 @@ def chainLinkShapeItem : MiniChainLink → ChainItem
   | .dot _ n => { kind := .dot, name := n.val, doc := .nil }
   | .privateDot _ n => { kind := .dot, name := n.val, doc := .nil }
   | .index _ i => { kind := .index, numericIndex := isNumericLit i, doc := .nil }
-  | .call _ args => chainCallItem args .nil
+  | .call _ _ args => chainCallItem args .nil
+  | .nonNull => { kind := .nonNull, doc := .nil }
+
+/-- The elements of a list of links, without their documents. -/
+def chainLinkShapeItems : List MiniChainLink → List ChainItem
+  | [] => []
+  | l :: rest => chainLinkShapeItem l :: chainLinkShapeItems rest
 
 /-- The elements of the member chain whose last node is `e`, without their
 documents: what the layout heuristics need in order to tell whether the
 chain is one prettier lays out as a member chain. -/
 def chainShapeItems : MiniExpr → List ChainItem
   | .dot o n =>
-      (if isChainNode o then chainShapeItems o else [chainBaseItem o .nil])
+      (if isChainNodeObject o then chainShapeItems o else [chainBaseItem o .nil])
         ++ [{ kind := .dot, name := n.val, doc := .nil }]
   | .privateDot o n =>
-      (if isChainNode o then chainShapeItems o else [chainBaseItem o .nil])
+      (if isChainNodeObject o then chainShapeItems o else [chainBaseItem o .nil])
         ++ [{ kind := .dot, name := n.val, doc := .nil }]
   | .index o i =>
-      (if isChainNode o then chainShapeItems o else [chainBaseItem o .nil])
+      (if isChainNodeObject o then chainShapeItems o else [chainBaseItem o .nil])
         ++ [{ kind := .index, numericIndex := isNumericLit i, doc := .nil }]
-  | .call f args =>
+  | .call f _ args =>
       (if isChainNode f then chainShapeItems f else [chainBaseItem f .nil])
         ++ [chainCallItem args .nil]
   | .chain b links =>
-      (if isChainSpine b then chainShapeItems b else [chainBaseItem b .nil])
-        ++ (links.hd :: links.tl).map chainLinkShapeItem
+      (if isChainSpineObject b then chainShapeItems b else [chainBaseItem b .nil])
+        ++ chainLinkShapeItems (links.hd :: links.tl)
+  -- a `!` is an element of the chain, which goes on into the expression
+  -- it is written on
+  | .nonNull e =>
+      (if isChainNodeObject e then chainShapeItems e else [chainBaseItem e .nil])
+        ++ [{ kind := .nonNull, doc := .nil }]
   | e => [chainBaseItem e .nil]
 
 /-- Whether prettier lays the expression out with the member chain layout.
@@ -1800,7 +2124,7 @@ one it breaks the line after the operator for: the chain breaks on its own
 instead. -/
 def printsAsMemberChain (e : MiniExpr) : Bool :=
   match e with
-  | .call f _ =>
+  | .call f _ _ =>
       isMemberish f
         && chainItemsAreMemberChain false (splitAfterLastCall (chainShapeItems e)).1
   | .chain _ _ =>
@@ -1810,7 +2134,7 @@ def printsAsMemberChain (e : MiniExpr) : Bool :=
 /-- Whether one of the calls along the spine of the expression is laid out
 with the member chain layout. -/
 def spineHasMemberChain : MiniExpr → Bool
-  | .call f args => printsAsMemberChain (.call f args) || spineHasMemberChain f
+  | .call f ta args => printsAsMemberChain (.call f ta args) || spineHasMemberChain f
   | .dot o _ | .privateDot o _ | .index o _ => spineHasMemberChain o
   -- the base of an optional chain may be a chain of its own, laid out
   -- with the member chain layout inside the parentheses it needs
@@ -1845,7 +2169,7 @@ def shouldBreakAfterOperator (shortKey : Bool) (rhs : MiniExpr) : Bool :=
         (match a with | .ternary .. => true | _ => false)
           || (match b with | .ternary .. => true | _ => false)
       else isBinaryish test && !shouldInlineLogical test
-  | .classExpr decorators _ _ _ => !decorators.isEmpty
+  | .classExpr decorators _ _ _ _ _ => !decorators.isEmpty
   | _ =>
     if shortKey then false
     else
@@ -1853,6 +2177,9 @@ def shouldBreakAfterOperator (shortKey : Bool) (rhs : MiniExpr) : Bool :=
         | .unary _ a => strip a
         | .await a => strip a
         | .yield (some a) => strip a
+        -- prettier reads through a `!` here as it reads through a unary
+        -- operator: `x = a?.b!.c!` breaks after the `=`
+        | .nonNull a => strip a
         | e => e
       let node := strip rhs
       isStringLit node ||
@@ -1874,7 +2201,7 @@ operator for. -/
 def neverBreakAfterOperator (shortKey : Bool) (rhs : MiniExpr) : Bool :=
   shortKey ||
     (match rhs with
-      | .template _ _ _ => true
+      | .template _ _ _ _ => true
       | .true_ | .false_ => true
       -- a `BigInt` literal is not a numeric literal to prettier, and does
       -- not keep the line of the operator
@@ -1892,7 +2219,7 @@ def isAssignExpr : MiniExpr → Bool
 arrow function, which the tail of a chain of assignments keeps on the line
 of its operator. -/
 def isArrowChainExpr : MiniExpr → Bool
-  | .arrow _ _ (.expr (.arrow ..)) => true
+  | .arrow _ _ _ _ (.expr (.arrow ..)) => true
   | _ => false
 
 /-- The layouts prettier chooses between for an assignment, a declarator,
@@ -1938,7 +2265,7 @@ def chooseAssignLayout (nodeIsAssign parentIsAssign grandparentIsStatement
     -- the head of a chain of more than two assignments
     .breakAfterOperator
   -- `const x = require("a/long/module/path");` keeps the line of the `=`
-  else if (match rhs with | .call (.ident n) _ => n.val == "require" | _ => false) then
+  else if (match rhs with | .call (.ident n) _ _ => n.val == "require" | _ => false) then
     .neverBreakAfterOperator
   else if complexLhs then .breakLhs
   else if shouldBreakAfterOperator shortKey rhs then .breakAfterOperator
@@ -1973,23 +2300,33 @@ def assignmentDoc (shortKey : Bool) (leftDoc : Doc) (op : String) (rhs : MiniExp
     leftDoc op rightDoc
 
 /-- The member accesses that trail the last call of a chain, added to the
-document of what comes before them. -/
-def chainTrailingAux (pos : Pos) (objIsIdent objIsCall objIsChain : Bool) (acc : Doc) :
-    List ChainItem → Doc
+document of what comes before them.  `optional` says that the chain is an
+optional one, which prettier reads into a chain expression of its own:
+that expression stands between the accesses and whatever holds the chain,
+so the rules read off what holds it do not reach them. -/
+def chainTrailingAux (optional : Bool) (pos : Pos) (objIsIdent objIsCall objIsChain : Bool)
+    (acc : Doc) : List ChainItem → Doc
   | [] => acc
   | i :: rest =>
       let p : Pos := if rest.isEmpty then pos else memberObjectPos false pos
+      -- a `!` keeps the line of what it is written on: TypeScript does not
+      -- read a `!` written at the start of a line as a non-null assertion
       let inline :=
-        i.kind == .index || memberInlines p objIsIdent objIsCall objIsChain (i.kind == .dot)
+        i.kind == .index || i.kind == .nonNull
+          || (if optional then memberInlinesInChain else memberInlines)
+              p objIsIdent objIsCall objIsChain (i.kind == .dot)
       -- the member chain layout of the object carries over to the accesses
       -- that trail it
-      chainTrailingAux pos false false objIsChain (memberDocOf inline acc i.doc) rest
+      chainTrailingAux optional pos false false objIsChain
+        (memberDocOf inline acc i.doc) rest
 
 /-- Lay out an optional chain, given its elements.  A chain that holds no
 call at all is not a member chain to prettier, which prints it as the
 member accesses it is made of: the accesses are not grouped together, so
-that the chain does not have to be laid out flat as a whole. -/
-def chainAssemble (pos : Pos) (items : List ChainItem) : Doc :=
+that the chain does not have to be laid out flat as a whole.  `optional`
+says that the chain holds a link written `?.`, which is what makes
+prettier read it into a chain expression of its own. -/
+def chainAssemble (optional : Bool) (pos : Pos) (items : List ChainItem) : Doc :=
   let (head, trailing) := splitAfterLastCall items
   let noCalls := !items.any (fun i => i.kind == .call || i.isCallBase)
   let headDoc := memberChainDoc (pos == .statement && trailing.isEmpty) noCalls head
@@ -2001,7 +2338,7 @@ def chainAssemble (pos : Pos) (items : List ChainItem) : Doc :=
       match head.getLast? with
       | some i => (i.kind == .call || i.isCallBase) && i.hasArgs
       | none => false
-    chainTrailingAux pos objIsIdent objIsCall
+    chainTrailingAux optional pos objIsIdent objIsCall
       (chainItemsAreMemberChain false head) headDoc trailing
 
 /-- Whether the last link of an optional chain is a member access rather
@@ -2016,6 +2353,8 @@ it has to break. -/
 def templateSubstIndents : MiniExpr → Bool
   | .ident _ | .dot .. | .privateDot .. | .index .. | .ternary .. | .seq _ _
   | .binary .. => true
+  -- an `as` and a `satisfies` are indented too; a `!` is not
+  | .asExpr .. | .satisfies .. => true
   | .chain _ links => chainEndsInMember links
   | _ => false
 
@@ -2046,6 +2385,8 @@ def nodeTag : MiniExpr → Nat
   | .arrow .. => 30 | .func .. => 31 | .new .. => 32 | .spread _ => 33
   | .template .. => 34 | .unary .. => 35 | .yield _ => 36 | .yieldFrom _ => 37
   | .jsx _ => 38
+  | .asExpr .. => 39 | .satisfies .. => 40 | .nonNull _ => 41
+  | .instantiation .. => 42
 
 /-- Whether the argument is one prettier may expand in place, keeping the
 rest of the call on one line.  `inChain` says that the argument is the
@@ -2055,7 +2396,10 @@ def couldExpandArg (inChain : Bool) : MiniExpr → Bool
   | .object (_ :: _) => true
   | .array (_ :: _) => true
   | .func .. => true
-  | .arrow _ _ body =>
+  -- prettier reads through an `as` or a `satisfies`: what it holds is
+  -- what the layout expands
+  | .asExpr e _ | .satisfies e _ => couldExpandArg inChain e
+  | .arrow _ _ _ _ body =>
       match body with
       | .block _ => true
       | .expr e =>
@@ -2071,18 +2415,41 @@ def couldExpandArg (inChain : Bool) : MiniExpr → Bool
         | _ => false
   | _ => false
 
+/-- Whether the type is a simple one: a name with no type arguments (which
+is what a predefined type such as `string` is too), a literal type, or
+`this`. -/
+def isSimpleTsType : MiniTsType → Bool
+  | .ref _ [] => true
+  | .strLit _ | .numLit _ | .negNumLit _ | .templateLit .. | .this => true
+  | _ => false
+
+/-- The type an `as` or a `satisfies` written as the second argument of a
+call is judged by: prettier looks through as many as two `[]`, and then
+through the one type argument of a name that takes exactly one. -/
+def shortArgumentType : MiniTsType → MiniTsType
+  | .array (.array ty) => throughOneArg ty
+  | .array ty => throughOneArg ty
+  | ty => throughOneArg ty
+where
+  /-- The one type argument of a name that takes exactly one. -/
+  throughOneArg : MiniTsType → MiniTsType
+    | .ref _ [arg] => arg
+    | ty => ty
+
 /-- Prettier's `isHopefullyShortCallArgument`, the test the second
 argument of a call has to pass for its first argument to be hugged. -/
 def isHopefullyShortCallArgument (e : MiniExpr) : Bool :=
   match e with
-  | .call _ args => args.length ≤ 1 && isSimpleCallArgument 2 e
-  | .new _ args => args.length ≤ 1 && isSimpleCallArgument 2 e
-  -- a chain that ends in a call is a call too
-  | .chain _ links =>
-      (match (links.hd :: links.tl).getLast? with
-        | some (.call _ args) => args.length ≤ 1
-        | _ => true)
-      && isSimpleCallArgument 2 e
+  -- `f(() => {…}, "" satisfies T)`: an `as` or a `satisfies` is short
+  -- when its type is a simple one and what it holds is a simple argument
+  | .asExpr inner ty | .satisfies inner ty =>
+      isSimpleTsType (shortArgumentType ty) && isSimpleCallArgument 1 inner
+  | .call _ _ args => args.length ≤ 1 && isSimpleCallArgument 2 e
+  | .new _ _ args => args.length ≤ 1 && isSimpleCallArgument 2 e
+  -- an optional chain is read as one expression, whatever its links:
+  -- unlike a plain call, a call written as its last link does not have
+  -- to take one argument at most
+  | .chain .. => isSimpleCallArgument 2 e
   | .importCall _ options => options.isNone && isSimpleCallArgument 2 e
   | .binary l _ r => isSimpleCallArgument 1 l && isSimpleCallArgument 1 r
   | .regex _ => true
@@ -2095,7 +2462,7 @@ def canHugFirstArg (args : List MiniExpr) : Bool :=
   | [first, second] =>
       (match first with
         | .func .. => true
-        | .arrow _ _ (.block _) => true
+        | .arrow _ _ _ _ (.block _) => true
         | _ => false)
       && (match second with
           | .func .. | .arrow .. | .ternary .. => false
@@ -2107,10 +2474,10 @@ def canHugFirstArg (args : List MiniExpr) : Bool :=
 /-- The arguments of a call, of a `new` or of the call at the end of an
 optional chain. -/
 def callArgumentsOf : MiniExpr → Option (List MiniExpr)
-  | .call _ args => some args
+  | .call _ _ args => some args
   | .chain _ links =>
       match (links.hd :: links.tl).getLast? with
-      | some (.call _ args) => some args
+      | some (.call _ _ args) => some args
       | _ => none
   | _ => none
 
@@ -2178,7 +2545,7 @@ dependency array, as `useEffect(() => { ... }, [a, b])` and
 writes as it finds them. -/
 def isHookCallWithDepsArray (args : List MiniExpr) : Bool :=
   let callbackAndDeps (fn deps : MiniExpr) : Bool :=
-    (match fn with | .arrow _ [] (.block _) => true | _ => false)
+    (match fn with | .arrow _ _ [] _ (.block _) => true | _ => false)
       && (match deps with | .array _ => true | _ => false)
   match args with
   | [fn, deps] => callbackAndDeps fn deps
@@ -2249,7 +2616,7 @@ def isAngularWrapperName : MiniExpr → Bool
 
 /-- A call of one of the wrappers an Angular test is written with. -/
 def isAngularTestWrapper : MiniExpr → Bool
-  | .call callee _ => isAngularWrapperName callee
+  | .call callee _ _ => isAngularWrapperName callee
   | _ => false
 
 /-- `beforeEach` and the other names a test framework sets a test up
@@ -2268,20 +2635,20 @@ def isFunctionOrArrowExpr : MiniExpr → Bool
 /-- A function expression, or an arrow function whose body is a block. -/
 def isFunctionOrArrowWithBlock : MiniExpr → Bool
   | .func .. => true
-  | .arrow _ _ (.block _) => true
+  | .arrow _ _ _ _ (.block _) => true
   | _ => false
 
 /-- The number of parameters of a function expression or an arrow. -/
 def exprParamCount : MiniExpr → Nat
-  | .func _ _ _ ps _ => ps.length
-  | .arrow _ ps _ => ps.length
+  | .func _ _ _ _ ps _ _ => ps.length
+  | .arrow _ _ ps _ _ => ps.length
   | _ => 0
 
 /-- Whether the expression is the name a test is given: a string literal
 or a template literal. -/
 def isTestName : MiniExpr → Bool
   | .string _ => true
-  | .template none _ _ => true
+  | .template none _ _ _ => true
   | _ => false
 
 /-- Whether the call is one of a test framework, as `it("name", () => {})`
@@ -2320,7 +2687,7 @@ def newCalleeObjOk : MiniExpr → Bool
   | .dot o _ => newCalleeObjOk o
   | .privateDot o _ => newCalleeObjOk o
   | .index o _ => newCalleeObjOk o
-  | .template (some tag) _ _ => newCalleeObjOk tag
+  | .template (some tag) _ _ _ => newCalleeObjOk tag
   -- an operator binds less tightly than `new`, so it keeps its parentheses
   | .postfix .. | .unary .. | .await _ | .yield _ | .yieldFrom _ | .spread _
   | .arrow .. | .func .. | .classExpr .. | .assign .. | .assignPattern ..
@@ -2333,6 +2700,11 @@ def newCalleeOk : MiniExpr → Bool
   -- parenthesised, as prettier parenthesises it everywhere a tag may not
   -- stand alone
   | .jsx _ => false
+  -- `new (C as any)()`: an `as` or a `satisfies` binds less tightly than
+  -- `new`, so the callee is parenthesised.  Written deeper inside the
+  -- callee, as the object a property is read off, it takes parentheses of
+  -- its own instead, `new (C as any).Inner()`
+  | .asExpr .. | .satisfies .. => false
   | e => newCalleeObjOk e
 
 /-- Would printing `op` directly in front of `e` run the two operators
@@ -2350,20 +2722,134 @@ is printed as a statement.  An object literal, a function or a class
 expression at the start of the statement is parenthesised on its own, by
 `inPosStart`. -/
 def needsStatementParens : MiniExpr → Bool
-  | .call f _ => needsStatementParens f
+  | .call f _ _ => needsStatementParens f
   | .dot o _ | .privateDot o _ | .index o _ | .postfix o _ | .chain o _ =>
       needsStatementParens o
   | .binary l _ _ | .assign l _ _ => needsStatementParens l
   | .ternary c _ _ => needsStatementParens c
-  | .template (some tag) _ _ => needsStatementParens tag
+  | .template (some tag) _ _ _ => needsStatementParens tag
   | _ => false
+
+/-! ## TypeScript helpers -/
+
+/-- The name of a type, or of a namespace: `A`, `A.B.C`. -/
+def tsEntityDoc : TsEntityName → Doc
+  | .ident n => t n.val
+  | .qualified o n => tsEntityDoc o ++ t ("." ++ n.val)
+
+/-- The precedence of a type expression, from 0 for the types that bind
+least (a conditional, a function and a constructor type) to 5 for a
+primary type.  A type written where a tighter one is expected takes
+parentheses. -/
+def tsTypePrec : MiniTsType → Nat
+  | .conditional .. | .fn .. | .ctor .. | .predicate .. => 0
+  | .union _ => 1
+  | .intersection _ => 2
+  | .keyof _ | .readonlyOp _ | .uniqueSymbol | .infer_ .. | .typeQuery .. => 3
+  | .importType true .. => 3
+  | .array _ | .indexed .. => 4
+  | _ => 5
+
+/-- The modifiers of a class member, in the order prettier writes them. -/
+def tsMemberModsDoc (m : TsMemberMods) : Doc :=
+  (if m.isDeclare then t "declare " else Doc.nil)
+    ++ (match m.accessibility with | none => Doc.nil | some a => t (a.text ++ " "))
+    ++ (if m.isStatic then t "static " else Doc.nil)
+    ++ (if m.isAbstract then t "abstract " else Doc.nil)
+    ++ (if m.isOverride then t "override " else Doc.nil)
+    ++ (if m.isReadonly then t "readonly " else Doc.nil)
+
+/-- The modifiers of a parameter property. -/
+def tsParamModsDoc (m : TsParamMods) : Doc :=
+  (match m.accessibility with | none => Doc.nil | some a => t (a.text ++ " "))
+    ++ (if m.isOverride then t "override " else Doc.nil)
+    ++ (if m.isReadonly then t "readonly " else Doc.nil)
+
+/-- Whether the parameter is a parameter property, which declares a
+member of the class as well.  Prettier writes the parameter list of a
+constructor that has one on lines of its own. -/
+def paramIsProperty : MiniParam → Bool
+  | .plain _ mods _ _ _ => !mods.isEmpty
+  | .rest .. => false
+
+/-- Whether the parameter list is one prettier always breaks: a list of
+more than one parameter, one of which is a parameter property. -/
+def paramsForceBreak (params : List MiniParam) : Bool :=
+  1 < params.length && params.any paramIsProperty
 
 /-- Whether the last parameter is a rest parameter, which forbids the
 trailing comma. -/
 def restLast (params : List MiniParam) : Bool :=
   match params.getLast? with
-  | some (.rest _) => true
+  | some (.rest ..) => true
   | _ => false
+
+/-- The parameter list of a function, a method or a function type, given
+the documents of its parameters.  A list one of whose parameters is a
+parameter property stands on lines of its own. -/
+def paramListDocOf (params : List MiniParam) (items : List Doc) : Doc :=
+  if paramsForceBreak params then sepListBroken "(" ")" false (if restLast params then .never else .all) items
+  else paramsDocOf (shouldHugTheOnlyParameter params) (restLast params) items
+
+/-- The parameter list of a function, not wrapped in a group of its own:
+prettier lays it out together with the return type, so that the two break
+as one. -/
+def paramListDocOpenOf (params : List MiniParam) (items : List Doc) : Doc :=
+  if paramsForceBreak params then sepListBroken "(" ")" false (if restLast params then .never else .all) items
+  else if shouldHugTheOnlyParameter params then t "(" ++ Doc.concat items ++ t ")"
+  else sepListOpen "(" ")" false (if restLast params then .never else .all) items
+
+/-- Whether the return type is an object type, which prettier lets break
+without breaking the parameter list in front of it. -/
+def retIsObjectType : Option MiniTsType → Bool
+  | some (.objectType _) | some (.mapped ..) => true
+  | _ => false
+
+/-- Whether prettier puts the parameter list of a function in a group of
+its own, so that the return type may break while the parameters stay on
+their line: it does so for a function of one parameter whose return type
+is an object type or one that has to break, and only when the type
+parameters are simple enough to stay on the line as well. -/
+def shouldGroupParams (typeParams : List MiniTsTypeParam) (params : List MiniParam)
+    (retIsObject : Bool) (retDoc : Doc) : Bool :=
+  let typeParamsFit :=
+    match typeParams with
+    | [] => true
+    | [tp] => tp.constraint.isNone && tp.default_.isNone
+    | _ => false
+  typeParamsFit && params.length == 1 && (retIsObject || Doc.hasForcedBreak retDoc)
+
+/-- The parameter list of a function or of a method together with its
+return type, which prettier lays out as one group: the parameter list
+writes no group of its own, so that the two break as one, unless the
+function is one whose parameters prettier keeps on their line.  `head`
+stands inside that group; it holds the type parameters of the signatures
+prettier breaks together with their parameter list, and is empty for the
+declarations whose type parameters break on their own. -/
+def signatureDocOf (head : Doc) (typeParams : List MiniTsTypeParam) (params : List MiniParam)
+    (retIsObject : Bool) (paramsDoc retDoc : Doc) : Doc :=
+  .group (head
+    ++ (if shouldGroupParams typeParams params retIsObject retDoc then .group paramsDoc
+        else paramsDoc)
+    ++ retDoc)
+
+/-- The signature of an arrow function: prettier writes the type
+parameters of an arrow, its parameters and its return type as one group,
+never keeping the parameters on their line while the return type breaks,
+and breaking them together with type parameters that break. -/
+def arrowSignatureOf (typeParams : List MiniTsTypeParam) (typeParamsDoc : Doc)
+    (params : List MiniParam) (paramItems : List Doc) (retType : Option MiniTsType)
+    (retDoc : Doc) : Doc :=
+  if arrowParensAvoided typeParams params retType then .group (Doc.concat paramItems)
+  else .group (typeParamsDoc ++ paramListDocOpenOf params paramItems ++ retDoc)
+
+/-- The signature of a function, given its parameters and its return
+type.  `head` holds the type parameters when they stand inside the group
+the parameter list is laid out by. -/
+def signatureOf (head : Doc) (typeParams : List MiniTsTypeParam) (params : List MiniParam)
+    (ret : Option MiniTsType) (paramItems : List Doc) (retDoc : Doc) : Doc :=
+  signatureDocOf head typeParams params (retIsObjectType ret)
+    (paramListDocOpenOf params paramItems) retDoc
 
 /-- Whether the statement is a block. -/
 def isBlockStmt : MiniStatement → Bool
@@ -2499,11 +2985,33 @@ def patternIsComplexDestructuring : MiniPattern → Bool
           || (match p.value with | .withDefault .. => true | _ => false))
   | _ => false
 
+/-- Whether the type annotation of a declarator is a complex one, which
+prettier breaks the left hand side of the declarator for: a type read by
+name with more than one type argument, one of which is itself written
+with type arguments or is a conditional type. -/
+def tsAnnotationIsComplex : Option MiniTsType → Bool
+  | some (.ref _ args) =>
+      1 < args.length
+        && args.any fun arg =>
+          match arg with
+          | .ref _ (_ :: _) => true
+          | .conditional .. => true
+          | _ => false
+  | _ => false
+
 /-- The decorators in front of a class or of a class member, given their
 documents. -/
 def decoratorsPrefix (items : List Doc) : Doc :=
   if items.isEmpty then Doc.nil
   else .group (Doc.joinWith .line items ++ .line)
+
+/-- A parameter written with decorators, `@Inject() x: T`.  Prettier
+lays the decorators out together with the parameter they stand in front
+of: they keep the line of the parameter where the whole of it fits, and
+stand on lines of their own where it does not. -/
+def paramDecoratorsDoc (items : List Doc) (param : Doc) : Doc :=
+  if items.isEmpty then param
+  else .group (Doc.joinWith .line items ++ .line ++ param)
 
 /-- The decorators of a class.  Prettier writes each of them on a line of
 its own: they break every group they stand in.  The lines themselves are
@@ -2540,50 +3048,85 @@ def heritageIsMember : MiniExpr → Bool
       | _ => false
   | _ => false
 
+/-- Whether prettier lays the heritage clauses of a class out as a group
+of their own, where they may stand on lines below the class name.  It
+does so when the class has more than one of them; when its one superclass
+is a property read written with no type arguments, unless the class is
+what an assignment writes; and when its one `implements` entry is a
+qualified name written with no type arguments. -/
+def classHeritageGroupMode (ofAssign : Bool) (heritage : Option MiniClassHeritage)
+    (implements_ : List MiniTsHeritage) : Bool :=
+  if 1 < (if heritage.isSome then 1 else 0) + implements_.length then true
+  else
+    match heritage, implements_ with
+    | some ⟨he, hargs⟩, _ => !ofAssign && hargs.isEmpty && heritageIsMember he
+    | none, [⟨.qualified .., []⟩] => true
+    | _, _ => false
+
 /-- A class, given the documents of its decorators, of its heritage clause
-and of its members.  `ownLine` says that prettier writes the `extends` on
-a line of its own when the header does not fit, which it does when the
-superclass is a property read; the brace of a non-empty body then stands
-on a line of its own too. -/
-def classDocOf (decorators : List Doc) (name : Option NEString) (ownLine : Bool)
-    (heritage : Doc) (body : List MiniClassElement) (items : List Doc) : Doc :=
-  let nameDoc := match name with | none => Doc.nil | some n => t (" " ++ n.val)
+and of its members.  `groupMode` says that prettier lays the heritage
+clauses out as a group of their own, which is what lets them stand on
+lines below the class name once the header does not fit; the brace of a
+non-empty body then stands on a line of its own too.  A class laid out
+the other way keeps its one clause on the line of the name, however long
+that line is: the type parameters break instead. -/
+def classDocOf (decorators : List Doc) (isAbstract : Bool) (name : Option NEString)
+    (typeParamsDoc : Doc) (groupMode : Bool) (heritage : Doc) (implementsDocs : List Doc)
+    (body : List MiniClassElement) (items : List Doc) : Doc :=
+  let nameDoc := (match name with | none => Doc.nil | some n => t (" " ++ n.val)) ++ typeParamsDoc
   let bodyDoc := classBodyOf body items
+  let clauses : List Doc :=
+    (match heritage with | .nil => [] | h => [t "extends " ++ .group h])
+      ++ (if implementsDocs.isEmpty then []
+          else
+            [.group (t "implements"
+              ++ .nest indentWidth (.line ++ Doc.joinWith (t "," ++ .line) implementsDocs))])
+  -- the clauses of a class laid out the other way keep their line: their
+  -- one entry is written where it stands, with no line to break at
+  let keptClauses : List Doc :=
+    (match heritage with | .nil => [] | h => [t "extends " ++ .group h])
+      ++ (if implementsDocs.isEmpty then []
+          else [t "implements " ++ Doc.joinWith (t ", ") implementsDocs])
   let headDoc :=
-    if ownLine then
-      let broken :=
-        nameDoc ++ .nest indentWidth (.hardline ++ t "extends " ++ .group heritage)
-          ++ (if body.isEmpty then t " " else .hardline)
-      if heritage.hasForcedBreak then broken
-      else .condGroup (nameDoc ++ t " extends " ++ heritage ++ t " ") broken
-    else nameDoc ++ t " extends " ++ heritage ++ t " "
+    match clauses with
+    | [] => nameDoc ++ t " "
+    | _ =>
+      if groupMode then
+        let flat := nameDoc ++ t " " ++ Doc.joinWith (t " ") clauses ++ t " "
+        let broken :=
+          nameDoc ++ .nest indentWidth (.hardline ++ Doc.joinWith .hardline clauses)
+            ++ (if body.isEmpty then t " " else .hardline)
+        if heritage.hasForcedBreak then broken else .condGroup flat broken
+      else nameDoc ++ t " " ++ Doc.joinWith (t " ") keptClauses ++ t " "
   classDecoratorsPrefix decorators
-    ++ t "class"
-    ++ (match heritage with
-        | .nil => nameDoc ++ t " "
-        | _ => headDoc)
+    ++ t (if isAbstract then "abstract class" else "class")
+    ++ headDoc
     ++ bodyDoc
 
 /-- A function, given the documents of its parameters and of its body.
 `hugParams` says that the function is an argument the layout expands in
 place, where prettier puts the whole parameter list on one line. -/
 def functionDocOf (hugParams isAsync isGen : Bool) (name : Option NEString)
-    (params : List MiniParam) (paramItems : List Doc)
-    (body : List MiniStatement) (bodyInner : Doc) : Doc :=
+    (typeParams : List MiniTsTypeParam) (typeParamsDoc : Doc) (params : List MiniParam)
+    (paramItems : List Doc) (ret : Option MiniTsType) (retDoc : Doc)
+    (body : Option (List MiniStatement)) (bodyInner : Doc) : Doc :=
   let paramsDoc :=
-    let d := paramsDocOf (shouldHugTheOnlyParameter params) (restLast params) paramItems
+    let d := paramListDocOpenOf params paramItems
     if hugParams then Doc.removeLines d else d
   t (if isAsync then "async function" else "function")
     ++ t (if isGen then "*" else "")
     ++ (match name with | none => t " " | some n => t (" " ++ n.val))
-    ++ paramsDoc ++ t " "
-    ++ blockDocOf true (bodyIsEmpty body) bodyInner
+    ++ typeParamsDoc ++ signatureDocOf .nil typeParams params (retIsObjectType ret) paramsDoc retDoc
+    ++ (match body with
+        | none => semiDoc
+        | some body => t " " ++ blockDocOf true (bodyIsEmpty body) bodyInner)
 
 /-- A method, given the documents of its name, its parameters and its
 body. -/
-def methodDocOf (kind : MethodKind) (key : Doc)
-    (params : List MiniParam) (paramItems : List Doc)
-    (body : List MiniStatement) (bodyInner : Doc) : Doc :=
+def methodDocOf (kind : MethodKind) (key : Doc) (optionalDoc typeParamsDoc : Doc)
+    (typeParams : List MiniTsTypeParam) (params : List MiniParam) (paramItems : List Doc)
+    (ret : Option MiniTsType) (retDoc : Doc)
+    (body : Option (List MiniStatement)) (bodyInner : Doc) : Doc :=
   let prefix_ := match kind with
     | .normal => ""
     | .generator => "*"
@@ -2591,8 +3134,11 @@ def methodDocOf (kind : MethodKind) (key : Doc)
     | .asyncGenerator => "async *"
     | .get => "get "
     | .set => "set "
-  t prefix_ ++ key ++ paramsDocOf (shouldHugTheOnlyParameter params) (restLast params) paramItems ++ t " "
-    ++ blockDocOf true (bodyIsEmpty body) bodyInner
+  t prefix_ ++ key ++ optionalDoc ++ typeParamsDoc
+    ++ signatureOf .nil typeParams params ret paramItems retDoc
+    ++ (match body with
+        | none => semiDoc
+        | some body => t " " ++ blockDocOf true (bodyIsEmpty body) bodyInner)
 
 /-- A declaration written with `keyword`, given the documents of its
 declarators.  A declaration of several names, one of which is given a
@@ -2726,12 +3272,229 @@ def binaryLayoutWith (pos : Pos) (l : MiniExpr) (op : BinOp) (r : MiniExpr)
       else
         .group (Doc.concat (parts.take 1) ++ .nest indentWidth (Doc.concat (parts.drop 1)))
 
+/-! ## Modules -/
+
+/-- Whether the item is a string literal statement, which is a directive
+where a program starts. -/
+def isStringItem : MiniModuleItem → Bool
+  | .stmt s => isStringStmt s
+  | _ => false
+
+/-- Whether the item is an empty statement, which prettier drops. -/
+def isEmptyItem : MiniModuleItem → Bool
+  | .stmt s => isEmptyStmt s
+  | _ => false
+
+/-- One `name`, `name as alias` or `type name` of an import or export
+clause. -/
+def specifierDoc (sp : TsSpecifier) : Doc :=
+  (if sp.isType then t "type " else Doc.nil) ++ t sp.name.val
+    ++ (match sp.alias_ with | none => Doc.nil | some a => t (" as " ++ a.val))
+
+/-- The `{ a, b as c }` of an import or export clause.  A clause of
+exactly one named specifier which stands alone -- with no default and no
+namespace specifier beside it -- is never broken, however long the line
+becomes; every other clause is a list which breaks one specifier to a
+line.  `withStandalone` says whether a default or namespace specifier
+stands beside these. -/
+def specifiersDoc (specs : List TsSpecifier) (withStandalone : Bool := false) : Doc :=
+  match specs with
+  | [sp] => if withStandalone then sepList "{" "}" true .es5 [specifierDoc sp]
+            else
+              let pad := if Options.bracketSpacing then " " else ""
+              t ("{" ++ pad) ++ specifierDoc sp ++ t (pad ++ "}")
+  | _ => sepList "{" "}" true .es5 (specs.map specifierDoc)
+
+/-- One attribute of an `import("mod", { with: … })` type, written as the
+property of an object literal it is there.  A key whose printed text is
+short keeps its value on the line of the colon however long the line
+becomes; a longer key breaks after the colon, the way any property whose
+value is a string does.  (The attributes of an `import` *declaration* are
+not written this way: prettier prints those flat, and they are built by
+`importAttrsDoc` below.) -/
+def importAttrItemDoc (quoteAll : Bool) (a : ImportAttr) : Doc :=
+  let keyText := if !quoteAll && isIdentifierName a.key then a.key else strLit a.key
+  let short := Doc.stringWidth keyText < tabWidth + 3
+  assignmentDocOf (if short then .neverBreakAfterOperator else .breakAfterOperator)
+    (t keyText) ":" (t (strLit a.value))
+
+/-- The `with { type: "json" }` of an import; nothing when there is no
+attribute.  The one attribute `type`, whose value is a string, is the one
+every engine knows, and prettier keeps it on the line of the import
+however long that line becomes; any other list of attributes is laid out
+as an object literal is. -/
+def importAttrsDoc (attrs : List ImportAttr) : Doc :=
+  if attrs.isEmpty then Doc.nil
+  else
+    -- the attributes are names of an object as far as `quoteProps` is
+    -- concerned: one of them that cannot lose its quotes quotes them all
+    let quoteAll := Options.quoteProps == .consistent
+      && attrs.any fun a => !isIdentifierName a.key && !isSimpleNumberString a.key
+    let items := attrs.map fun a =>
+      t ((if !quoteAll && isIdentifierName a.key then a.key else strLit a.key)
+        ++ ": " ++ strLit a.value)
+    let listDoc := sepList "{" "}" true .es5 items
+    let isTypeOnly := match attrs with | [a] => a.key == "type" | _ => false
+    t " with " ++ (if isTypeOnly then Doc.removeLines listDoc else listDoc)
+
+/-- The arguments of an `import("mod", { with: { type: "json" } })` type:
+the module, and the import attributes written as the object they are.  An
+empty list of attributes is no second argument at all.  The two arguments
+are laid out the way the arguments of a call are — the object hugs the
+line of the import, and stands on lines of its own once it no longer fits
+there — except that they take no trailing comma. -/
+def importTypeArgsDoc (mod : String) (attrs : List ImportAttr) : Doc :=
+  let modDoc := t (strLit mod)
+  if attrs.isEmpty then t "(" ++ modDoc ++ t ")"
+  else
+    -- the attributes are names of an object as far as `quoteProps` is
+    -- concerned: one of them that cannot lose its quotes quotes them all
+    let quoteAll := Options.quoteProps == .consistent
+      && attrs.any fun a => !isIdentifierName a.key && !isSimpleNumberString a.key
+    let items := attrs.map (importAttrItemDoc quoteAll)
+    let objDoc := sepList "{" "}" true .es5 [t "with: " ++ sepList "{" "}" true .es5 items]
+    argumentsDocOf .never false false false false true [modDoc, objDoc] [] [modDoc, objDoc]
+
+/-- An `import` declaration. -/
+def importDoc : MiniImportDeclaration → Doc
+  | .bare mod attrs =>
+      t ("import " ++ strLit mod.val) ++ importAttrsDoc attrs ++ semiDoc
+  | .equals isExport name rhs =>
+      t (if isExport then "export import " else "import ") ++ t (name.val ++ " = ")
+        ++ (match rhs with
+            | .require mod => t ("require(" ++ strLit mod ++ ")")
+            | .entity e => tsEntityDoc e)
+        ++ semiDoc
+  | .clause c =>
+      let standalone : List Doc :=
+        (match c.default_ with | none => [] | some d => [t d.val])
+        ++ (match c.namespace_ with | none => [] | some n => [t ("* as " ++ n.val)])
+      let parts : List Doc :=
+        standalone
+        -- an empty list of named imports is written out only when it is
+        -- the whole clause: `import d, {} from "m"` binds `d` alone
+        ++ (match c.named with
+            | none => []
+            | some [] => if standalone.isEmpty then [specifiersDoc []] else []
+            | some specs => [specifiersDoc specs !standalone.isEmpty])
+      t "import " ++ (if c.isType then t "type " else Doc.nil) ++ Doc.joinWith (t ", ") parts
+        ++ t (" from " ++ strLit c.mod.val) ++ importAttrsDoc c.attrs ++ semiDoc
+
+/-! ## The shapes of types prettier's printers look at -/
+
+/-- The place a type stands in, as far as a conditional type there is
+concerned: prettier writes the conditional types of a chain, which stand
+in the `:` branch of the one before them, as one group, and parenthesises
+one which stands in a `?` branch. -/
+inductive TsTypeMode where
+  /-- Anywhere but in a branch of a conditional type. -/
+  | normal
+  /-- The `?` branch of a conditional type. -/
+  | condBranch
+  /-- The `:` branch of a conditional type. -/
+  | condAlt
+  /-- The `extends` clause of a conditional type, where a function type
+  and a constructor type need no parentheses of their own. -/
+  | condExtends
+  /-- The type a conditional type checks. -/
+  | condCheck
+deriving BEq, Inhabited
+
+/-- The names TypeScript reads as a keyword type rather than as the name
+of a type declared elsewhere. -/
+def tsKeywordTypeNames : List String :=
+  ["any", "bigint", "boolean", "false", "never", "null", "number", "object",
+    "string", "symbol", "true", "undefined", "unknown", "void"]
+
+/-- Whether the type is one prettier counts as an object type, which its
+intersection printer keeps on the line of the `&` before it. -/
+def tsIsObjectType : MiniTsType → Bool
+  | .objectType _ | .mapped .. => true
+  | _ => false
+
+/-- Whether the type names a type declared elsewhere, rather than being
+one of the keyword types. -/
+def tsIsTypeRef : MiniTsType → Bool
+  | .ref (.ident n) _ => !tsKeywordTypeNames.contains n.val
+  | .ref (.qualified ..) _ => true
+  | _ => false
+
+/-- Whether the type is `void` or `null`. -/
+def tsIsVoidOrNull : MiniTsType → Bool
+  | .ref (.ident n) [] => n.val == "void" || n.val == "null"
+  | _ => false
+
+/-- Whether the members seen so far are ones prettier keeps on one line:
+one object type or one named type, and `void` or `null` everywhere else.
+`seen` records that the one object or named type has been met. -/
+def tsUnionHugAux (seen : Bool) : List MiniTsType → Bool
+  | [] => seen
+  | ty :: rest =>
+      if tsIsObjectType ty || tsIsTypeRef ty then
+        (!seen && tsUnionHugAux true rest)
+      else if tsIsVoidOrNull ty then tsUnionHugAux seen rest
+      else false
+
+/-- Whether prettier writes the union on one line however long it is, as
+it does with `{ a: string } | null`. -/
+def tsUnionShouldHug (types : List MiniTsType) : Bool := tsUnionHugAux false types
+
+/-- The members of an intersection after the first, following prettier:
+two object types stand on one line, `{ … } & { … }`; two other types are
+written with the `&` at the end of the line and the member after it
+indented; and where the two kinds meet, every member after the second is
+indented too.  `prevObject` says that the member before this one is an
+object type, `indented` that a member of the first kind is indented, and
+`idx` counts the members. -/
+def tsIntersectionAux (prevObject indented : Bool) (idx : Nat) :
+    List (Bool × Doc) → Doc
+  | [] => Doc.nil
+  | (cur, d) :: rest =>
+      if idx == 0 then d ++ tsIntersectionAux cur indented 1 rest
+      else if prevObject && cur then
+        t " & " ++ (if indented then .nest indentWidth d else d)
+          ++ tsIntersectionAux cur indented (idx + 1) rest
+      else if !prevObject && !cur then
+        .nest indentWidth
+            (if Options.operatorAtStart then .line ++ t "& " ++ d else t " &" ++ .line ++ d)
+          ++ tsIntersectionAux cur indented (idx + 1) rest
+      else
+        t " & " ++ (if 1 < idx then .nest indentWidth d else d)
+          ++ tsIntersectionAux cur (indented || 1 < idx) (idx + 1) rest
+
+/-- The members of an intersection, `A & B`. -/
+def tsIntersectionAssemble (parts : List (Bool × Doc)) : Doc :=
+  tsIntersectionAux false false 0 parts
+
+/-- The members of a union, `A | B`, each on a line of its own with a
+leading `|` when they break. -/
+def tsUnionInnerDoc (items : List Doc) : Doc :=
+  .group (Doc.ifBreak (t "| ") .nil ++ Doc.joinWith (.line ++ t "| ") items)
+
 /-! ## The printing context -/
 
 /-- Whether the expression applies the `in` operator. -/
 def isInOperator : MiniExpr → Bool
   | .binary _ .inOp _ => true
   | _ => false
+
+/-- Whether the type is a simple one in prettier's sense: a name written
+without type arguments, a predefined type, or a literal type. -/
+def tsTypeIsSimple : MiniTsType → Bool
+  | .ref _ [] => true
+  | .this => true
+  | .strLit _ | .numLit _ | .negNumLit _ => true
+  | .templateLit .. => true
+  | _ => false
+
+/-- Whether prettier hugs the type when it stands alone between the angle
+brackets of a list of type arguments, writing `Foo<{` and `}>` rather than
+breaking the brackets around it: it does so for a simple type, for an
+object type, and for a union of an object type with `void` or `null`. -/
+def tsShouldHugType : MiniTsType → Bool
+  | .objectType _ | .mapped .. => true
+  | .union types => tsUnionShouldHug types
+  | ty => tsTypeIsSimple ty
 
 /-- What the printer has to know about the place the tree it walks stands
 in.  The head of a `for (;;)` is read with the `in` operator ruled out, so
@@ -2741,6 +3504,16 @@ the very printer being defined, it is passed here as `forInit`. -/
 structure PrintCtx where
   /-- Whether this stands inside the first clause of a `for (;;)`. -/
   inForInit : Bool
+  /-- Whether to write the parentheses which say what the text means
+  where TypeScript would otherwise read it back as another tree: around
+  an instantiation expression, `f<T>`, which is read as a pair of
+  comparisons wherever the token after it does not rule that out, and
+  around the test of a `case`, whose `:` the parser may take for the one
+  of the clause.  Prettier writes none of them, and neither does the
+  printer in its ordinary mode: the mode is there so that a text holding
+  the tree the printer means can be handed to prettier and its answer
+  compared with the ordinary output. -/
+  guarded : Bool := false
   /-- How the first clause of a `for (;;)` is printed. -/
   forInit : MiniForInit → Doc
 
@@ -2750,7 +3523,7 @@ variable (ctx : PrintCtx)
 
 -- the printer is one large mutual block; elaborating it takes more than
 -- the default budget
-set_option maxHeartbeats 1000000 in
+set_option maxHeartbeats 4000000 in
 mutual
 
 /-- Whether the expression has to be parenthesised in this position.  An
@@ -2806,6 +3579,417 @@ def returnArgWith (e : MiniExpr) (d : Doc) : Doc :=
         ++ .softline ++ .ifBreak (t ")") .nil)
   | _ => d
 
+-- ### Types
+
+/-- The documents of a list of types, each binding at least as tight as
+`minPrec`. -/
+def tsTypeDocs (mode : TsTypeMode) (indentUnion : Bool) (minPrec : Nat) :
+    List MiniTsType → List Doc
+  | [] => []
+  | ty :: rest =>
+      tsTypeDoc mode indentUnion minPrec ty :: tsTypeDocs mode indentUnion minPrec rest
+
+/-- The members of a union, each indented by two columns of its own, the
+way prettier aligns them under the `|` that introduces them. -/
+def tsUnionMemberDocs : List MiniTsType → List Doc
+  | [] => []
+  -- an intersection written as a member of a union keeps parentheses of
+  -- its own, which is why the members are written as if they bound
+  -- tighter than an intersection does
+  | ty :: rest => .align 2 (tsTypeDoc .normal false 3 ty) :: tsUnionMemberDocs rest
+
+/-- The type arguments of a name, `<A, B>`; they take no trailing comma
+when they break. -/
+def tsTypeArgsDoc : List MiniTsType → Doc
+  | [] => Doc.nil
+  -- a lone argument that prettier hugs is written between the brackets
+  -- themselves, so that it may break while they stay where they are
+  | [ty] =>
+      if tsShouldHugType ty then t "<" ++ tsTypeDoc .normal false 0 ty ++ t ">"
+      else sepList "<" ">" false .never [tsTypeDoc .normal false 0 ty]
+  | ty :: rest => sepList "<" ">" false .never (tsTypeDoc .normal false 0 ty :: tsTypeDocs .normal false 0 rest)
+
+/-- One type parameter, `const in out T extends C = D`.  The constraint
+and the default are laid out the way prettier lays the right hand side of
+an assignment out: each of them keeps the line of its operator while its
+first line fits there, and stands indented below it otherwise. -/
+def tsTypeParamDoc : MiniTsTypeParam → Doc
+  | ⟨isConst, variance, name, constraint, default_⟩ =>
+    .group ((if isConst then t "const " else Doc.nil)
+      ++ (match variance with | none => Doc.nil | some v => t (v.text ++ " "))
+      ++ t name.val
+      ++ (match constraint with
+          | none => Doc.nil
+          -- a conditional type written as the constraint of a type
+          -- parameter keeps parentheses of its own
+          | some c =>
+            t " extends"
+              ++ .fluidLine indentWidth
+                  (tsTypeDoc .normal true (match c with | .conditional .. => 1 | _ => 0) c))
+      ++ (match default_ with
+          | none => Doc.nil
+          | some d => t " =" ++ .fluidLine indentWidth (tsTypeDoc .normal true 0 d)))
+
+def tsTypeParamDocs : List MiniTsTypeParam → List Doc
+  | [] => []
+  | tp :: rest => tsTypeParamDoc tp :: tsTypeParamDocs rest
+
+/-- The type parameters of a declaration, `<T extends C>`; they take a
+trailing comma when they break.  `tsxComma` writes the trailing comma
+that the one type parameter of an arrow function keeps, since `<T>` alone
+would open an element in a file read with JSX enabled. -/
+def tsTypeParamsDocOf (tsxComma : Bool) : List MiniTsTypeParam → Doc
+  | [] => Doc.nil
+  | tp :: rest =>
+      let items := tsTypeParamDoc tp :: tsTypeParamDocs rest
+      -- in a file read with JSX enabled, `<T>` alone opens an element, so
+      -- the one type parameter of an arrow function keeps a comma of its
+      -- own, written whether the list breaks or not.  A constraint is
+      -- enough to tell the two apart, so a constrained parameter takes
+      -- the ordinary layout; a default is not.
+      let bare := match tp with | ⟨_, _, _, none, _⟩ => true | _ => false
+      if tsxComma && rest.isEmpty && bare then
+        .group (t "<" ++ .nest indentWidth (.softline ++ tsTypeParamDoc tp ++ t ",")
+          ++ .softline ++ t ">")
+      else sepList "<" ">" false .es5 items
+
+/-- A type annotation, `: T`; nothing when there is none. -/
+def tsAnnotation : Option MiniTsType → Doc
+  | none => Doc.nil
+  | some ty => t ": " ++ tsTypeDoc .normal true 0 ty
+
+/-- The return type of an arrow function.  A function type written there
+keeps parentheses of its own: without them the `=>` of the type would be
+read as the one of the arrow.  A constructor type, which starts with
+`new`, needs none. -/
+def tsArrowAnnotation : Option MiniTsType → Doc
+  | none => Doc.nil
+  | some ty =>
+      let d := tsTypeDoc .normal true 0 ty
+      match ty with
+      | .fn .. => t ": (" ++ d ++ t ")"
+      | _ => t ": " ++ d
+
+/-- The members of an object type, `{ a: A; b(): B }`, without the group
+that lays them out: it is what prettier writes for the object type of the
+one parameter of a function it hugs, where the parameter list itself is
+the group that decides whether the members break. -/
+def tsObjectTypeContent (items : List Doc) : Doc :=
+  t "{" ++ .nest indentWidth
+      (braceLine ++ Doc.joinWith (tsMemberSep ++ .line) items ++ tsMemberTrailer)
+    ++ braceLine ++ t "}"
+
+/-- The members of an object type, `{ a: A; b(): B }`. -/
+def tsObjectTypeDoc (items : List Doc) : Doc :=
+  if items.isEmpty then t "{}"
+  else .group (tsObjectTypeContent items)
+
+/-- The members of an interface, which always stand on lines of their
+own. -/
+def tsInterfaceBodyDoc (items : List Doc) : Doc :=
+  if items.isEmpty then t "{}"
+  else
+    t "{" ++ .nest indentWidth
+        (.hardline ++ Doc.joinWith (tsBrokenMemberSep ++ .hardline) items ++ tsBrokenMemberSep)
+      ++ .hardline ++ t "}"
+
+/-- The members of an intersection, each with whether it is an object
+type. -/
+def tsIntersectionParts : List MiniTsType → List (Bool × Doc)
+  | [] => []
+  | ty :: rest => (tsIsObjectType ty, tsTypeDoc .normal false 3 ty) :: tsIntersectionParts rest
+
+/-- A type expression, parenthesised when it binds less tight than the
+place it stands in asks for. -/
+def tsTypeDoc (mode : TsTypeMode) (indentUnion : Bool) (minPrec : Nat) : MiniTsType → Doc
+  | .ref name args => tsEntityDoc name ++ tsTypeArgsDoc args
+  | .this => t "this"
+  | .strLit v => t (strLit v)
+  | .numLit n => t n.render
+  | .negNumLit n => t ("-" ++ n.render)
+  | .array elem => parenIf (4 < minPrec) (tsTypeDoc .normal false 4 elem ++ t "[]")
+  | .indexed obj idx =>
+      parenIf (4 < minPrec) (tsTypeDoc .normal false 4 obj ++ t "[" ++ tsTypeDoc .normal true 0 idx ++ t "]")
+  | .union types =>
+      if tsUnionShouldHug types then
+        parenIf (1 < minPrec) (Doc.joinWith (t " | ") (tsTypeDocs .normal false 2 types))
+      else
+        let inner := tsUnionInnerDoc (tsUnionMemberDocs types)
+        -- a union in parentheses puts them on lines of their own when it
+        -- breaks, as in `(\n  | A\n  | B\n)[]`
+        if 1 < minPrec then
+          t "(" ++ .group (.nest indentWidth (.softline ++ inner) ++ .softline) ++ t ")"
+        else if indentUnion then .group (.nest indentWidth (.softline ++ inner))
+        else inner
+  | .intersection types =>
+      parenIf (2 < minPrec) (.group (tsIntersectionAssemble (tsIntersectionParts types)))
+  | .fn tps params ret =>
+      parenIf (0 < minPrec && mode != .condExtends)
+        (signatureOf (tsTypeParamsDocOf false tps) tps params (some ret) (paramDocs params)
+          (t " => " ++ tsTypeDoc .normal true 0 ret))
+  | .ctor isAbstract tps params ret =>
+      parenIf (0 < minPrec && mode != .condExtends)
+        (t (if isAbstract then "abstract new " else "new ")
+          ++ signatureOf (tsTypeParamsDocOf false tps) tps params (some ret) (paramDocs params)
+              (t " => " ++ tsTypeDoc .normal true 0 ret))
+  | .typeQuery name args =>
+      parenIf (3 < minPrec) (t "typeof " ++ tsEntityDoc name ++ tsTypeArgsDoc args)
+  -- `keyof (readonly A[])`: a `readonly` operand of a `keyof` keeps
+  -- parentheses of its own
+  | .keyof ty =>
+      parenIf (3 < minPrec)
+        (t "keyof "
+          ++ tsTypeDoc .normal false
+              (match ty with
+                -- a type operator written as the operand of a `keyof`
+                -- keeps parentheses of its own
+                | .readonlyOp _ | .keyof _ | .uniqueSymbol => 4
+                | _ => 3) ty)
+  | .readonlyOp ty => parenIf (3 < minPrec) (t "readonly " ++ tsTypeDoc .normal false 3 ty)
+  | .uniqueSymbol => parenIf (3 < minPrec) (t "unique symbol")
+  | .infer_ n none => parenIf (3 < minPrec) (t ("infer " ++ n.val))
+  -- the constraint of an `infer` is laid out the way the constraint of a
+  -- type parameter is: it keeps the line of the `extends` while its first
+  -- line fits there, and stands indented below it otherwise
+  | .infer_ n (some c) =>
+      parenIf (3 < minPrec)
+        (.group (t ("infer " ++ n.val ++ " extends")
+          ++ .fluidLine indentWidth (tsTypeDoc .normal false 1 c)))
+  | .conditional check ext trueType falseType =>
+      if Options.experimentalTernaries then
+        -- prettier lays a conditional type out the way it lays a
+        -- conditional expression out under the option: the `?` stands at
+        -- the end of the line of the `extends`, and the chain reads as a
+        -- list of cases
+        let consIsCond := match trueType with | .conditional .. => true | _ => false
+        let altIsCond := match falseType with | .conditional .. => true | _ => false
+        let parentIsCond := mode != .normal
+        let inTest := mode == .condCheck || mode == .condExtends
+        let chainTail := altIsCond || mode == .condAlt
+        let bigTabs := 2 < tabWidth || Options.useTabs
+        -- the test of a conditional type is grouped unless the type
+        -- stands in a branch of a conditional type of its own
+        let groupTest := chainTail || !parentIsCond
+        let wrapParens (d : Doc) : Doc :=
+          .ifBreak (t "(") .nil ++ .nest indentWidth (.softline ++ d) ++ .softline
+            ++ .ifBreak (t ")") .nil
+        -- the `extends` type stands between parentheses of its own once
+        -- it no longer holds the line; a conditional type and a mapped
+        -- type are written there as they are
+        let extDoc := tsTypeDoc .condExtends true 1 ext
+        let extPart : Doc :=
+          match ext with
+          | .conditional .. | .mapped .. => extDoc
+          | _ => .group (wrapParens extDoc)
+        let testPart : Doc :=
+          .groupId 0 (tsTypeDoc .condCheck true 1 check ++ t " extends " ++ extPart ++ t " ?")
+        let consPart : Doc :=
+          .nest indentWidth
+            ((if consIsCond then Doc.hardline else Doc.line)
+              ++ tsTypeDoc .condBranch false 0 trueType)
+        let head : Doc :=
+          if groupTest then
+            .groupId 1 (testPart
+              ++ (if chainTail then consPart else .ifBreakOf 0 consPart (.group consPart)))
+          else testPart ++ consPart
+        let altDoc := tsTypeDoc .condAlt false 0 falseType
+        let sep : Doc := if altIsCond then .hardline else .line
+        let pad : Doc :=
+          if altIsCond || !bigTabs then t " "
+          else
+            let filler := t (if Options.useTabs then "\t" else String.pushn "" ' ' (tabWidth - 1))
+            if groupTest then
+              .ifBreakOf 1 filler (.ifBreak (if chainTail then t " " else filler) (t " "))
+            else .ifBreak filler (t " ")
+        let altPart : Doc := if altIsCond then altDoc else .group (.nest indentWidth altDoc)
+        -- a chain of conditional types always breaks
+        let forced := consIsCond || altIsCond
+        let body : Doc :=
+          head ++ sep ++ t ":" ++ pad ++ altPart ++ (if forced then Doc.breakParent else .nil)
+        Doc.scopeIds
+          (if inTest then
+            -- a conditional type written as the check or as the `extends`
+            -- type of another one stands on lines of its own inside the
+            -- parentheses it takes there
+            if 0 < minPrec then
+              t "(" ++ .group (.nest indentWidth (.softline ++ body) ++ .softline) ++ t ")"
+            else .group (.nest indentWidth (.softline ++ body))
+          else if !parentIsCond then parenIf (0 < minPrec) (.group body)
+          else body)
+      else
+      -- the conditional types of a chain, each of which stands in the `:`
+      -- branch of the one before it, are laid out as one group, with each
+      -- link two columns further in than the one before it; a conditional
+      -- type in a `?` branch is parenthesised and starts a chain of its own
+      -- a union written as the type the conditional checks stands on
+      -- lines of its own, indented, the way a union on the right of an
+      -- `=` does
+      let head := tsTypeDoc .condCheck true 1 check ++ t " extends "
+        ++ tsTypeDoc .condExtends true 1 ext
+      -- a branch stands two columns further in, written as a step of its
+      -- own where the indentation is tabs
+      let branch (d : Doc) : Doc := if Options.useTabs then Doc.nest indentWidth d else Doc.align 2 d
+      -- the branches of a conditional written in the `?` branch of one
+      -- stand `tabWidth - 2` columns further in; with tabs they stand
+      -- where they are
+      let chainAlign (d : Doc) : Doc :=
+        if mode == .condBranch && !Options.useTabs && 2 < tabWidth then Doc.align (tabWidth - 2) d
+        else d
+      let branches := chainAlign (.line ++ t "? "
+        ++ branch (tsTypeDoc .condBranch false 0 trueType)
+        ++ .line ++ t ": " ++ branch (tsTypeDoc .condAlt false 0 falseType))
+      match mode with
+      | .condAlt => Doc.align 2 head ++ branches
+      -- a conditional type in a `?` branch is written as part of the
+      -- chain around it, and takes parentheses only while that chain
+      -- stands on one line
+      -- the branches stand two columns in from the `?` of the chain
+      -- around it, which the `?` itself is already indented by
+      | .condBranch =>
+          .ifBreak .nil (t "(") ++ head ++ branches ++ .ifBreak .nil (t ")")
+      | .normal | .condExtends | .condCheck =>
+          let inner := .group (head ++ .nest indentWidth branches)
+          -- a conditional type written as the check or as the `extends`
+          -- type of another one stands on lines of its own inside the
+          -- parentheses it takes there
+          if 0 < minPrec then
+            if mode == .condExtends || mode == .condCheck then
+              t "(" ++ .group (.nest indentWidth (.softline ++ inner) ++ .softline) ++ t ")"
+            else parens inner
+          else inner
+  | .objectType members => tsObjectTypeDoc (tsTypeMemberDocsOf (quoteAllTypeMembers members) members)
+  | .mapped readonlyMod key constraint as_ optionalMod value =>
+      let modDoc (m : Option TsMappedMod) (text : String) : Doc :=
+        match m with
+        | none => Doc.nil
+        | some .keep => t text
+        | some .add => t ("+" ++ text)
+        | some .remove => t ("-" ++ text)
+      let inner :=
+        modDoc readonlyMod "readonly "
+          -- the key of a mapped type takes lines of its own when it is
+          -- too long to stand between the brackets on one line
+          ++ .group (t "[" ++ .nest indentWidth (.softline
+                ++ t (key.val ++ " in ") ++ tsTypeDoc .normal true 0 constraint
+                ++ (match as_ with
+                    | none => Doc.nil
+                    | some a => t " as " ++ tsTypeDoc .normal true 0 a))
+              ++ .softline ++ t "]")
+          ++ modDoc optionalMod "?"
+          ++ (match value with | none => Doc.nil | some v => t ": " ++ tsTypeDoc .normal true 0 v)
+      .group (t "{" ++ .nest indentWidth (braceLine ++ inner ++ tsMemberTrailer)
+        ++ braceLine ++ t "}")
+  | .tuple elems =>
+      sepList "[" "]" false .es5 (tsTupleElemDocs (1 < elems.length) elems)
+  | .templateLit head parts =>
+      t "`" ++ t (encodeTemplateText head) ++ tsTemplatePartsDoc parts ++ t "`"
+  | .importType isTypeof mod attrs qualifier args =>
+      parenIf (isTypeof && 3 < minPrec)
+        ((if isTypeof then t "typeof " else Doc.nil)
+          ++ t "import" ++ importTypeArgsDoc mod attrs
+          ++ (match qualifier with | none => Doc.nil | some q => t "." ++ tsEntityDoc q)
+          ++ tsTypeArgsDoc args)
+  | .predicate asserts param type =>
+      parenIf (0 < minPrec)
+        ((if asserts then t "asserts " else Doc.nil) ++ t param.val
+          ++ (match type with | none => Doc.nil | some ty => t " is " ++ tsTypeDoc .normal true 0 ty))
+
+/-- The `${…}` substitutions of a template literal type, and the text
+between them.  Prettier writes what stands between the braces on one
+line, however long it is, so every line inside it is written flat. -/
+def tsTemplatePartsDoc : List MiniTsTemplatePart → Doc
+  | [] => Doc.nil
+  | ⟨ty, suffix⟩ :: rest =>
+      t "${" ++ Doc.removeLines (tsTypeDoc .normal true 0 ty) ++ t "}"
+        ++ t (encodeTemplateText suffix) ++ tsTemplatePartsDoc rest
+
+/-- One element of a tuple type.  `multi` says that the tuple holds more
+than one element, where prettier parenthesises a union that breaks. -/
+def tsTupleElemDoc (multi : Bool) : MiniTsTupleElem → Doc
+  | .elem (.union types) =>
+      if tsUnionShouldHug types then
+        Doc.joinWith (t " | ") (tsTypeDocs .normal false 2 types)
+      else
+        let inner := tsUnionInnerDoc (tsUnionMemberDocs types)
+        -- a union that breaks inside a tuple of more than one element is
+        -- parenthesised
+        if multi then
+          .group (.nest indentWidth (.ifBreak (t "(" ++ .softline) .nil ++ inner)
+            ++ .softline ++ .ifBreak (t ")") .nil)
+        else inner
+  | .elem ty => tsTypeDoc .normal false 0 ty
+  -- prettier writes the `?` of an optional element after the type as it
+  -- stands, with no parentheses of its own: `[typeof a?]`, `[a | b?]`.
+  -- A union takes the layout it takes as an element, with the `?` after
+  -- its last member, inside the parentheses a broken union is given.
+  | .optional (.union types) =>
+      if tsUnionShouldHug types then
+        Doc.joinWith (t " | ") (tsTypeDocs .normal false 2 types) ++ t "?"
+      else
+        let inner := tsUnionInnerDoc (tsUnionMemberDocs types) ++ t "?"
+        if multi then
+          .group (.nest indentWidth (.ifBreak (t "(" ++ .softline) .nil ++ inner)
+            ++ .softline ++ .ifBreak (t ")") .nil)
+        else inner
+  | .optional ty => tsTypeDoc .normal false 0 ty ++ t "?"
+  | .rest ty => t "..." ++ tsTypeDoc .normal true 0 ty
+  | .named name isOptional isRest ty =>
+      (if isRest then t "..." else Doc.nil) ++ t name.val
+        ++ (if isOptional then t "?" else Doc.nil) ++ t ": " ++ tsTypeDoc .normal true 0 ty
+
+def tsTupleElemDocs (multi : Bool) : List MiniTsTupleElem → List Doc
+  | [] => []
+  | e :: rest => tsTupleElemDoc multi e :: tsTupleElemDocs multi rest
+
+/-- One member of an interface, or of an object type. -/
+def tsTypeMemberDoc (quoteAll : Bool) : MiniTsTypeMember → Doc
+  | .property isReadonly key isOptional type =>
+      (if isReadonly then t "readonly " else Doc.nil) ++ propertyKeyDoc quoteAll key
+        ++ (if isOptional then t "?" else Doc.nil) ++ tsAnnotation type
+  | .method kind key isOptional tps params ret =>
+      t (match kind with | .normal => "" | .get => "get " | .set => "set ")
+        ++ propertyKeyDoc quoteAll key ++ (if isOptional then t "?" else Doc.nil)
+        ++ signatureOf (tsTypeParamsDocOf false tps) tps params ret (paramDocs params)
+            (tsAnnotation ret)
+  | .callSig tps params ret =>
+      signatureOf (tsTypeParamsDocOf false tps) tps params ret (paramDocs params)
+        (tsAnnotation ret)
+  | .ctorSig tps params ret =>
+      t "new " ++ signatureOf (tsTypeParamsDocOf false tps) tps params ret (paramDocs params)
+        (tsAnnotation ret)
+  | .indexSig isReadonly name keyType valueType =>
+      (if isReadonly then t "readonly " else Doc.nil)
+        -- the brackets of an index signature break around what they hold
+        ++ t "[" ++ .group (.nest indentWidth
+              (.softline ++ t (name.val ++ ": ") ++ tsTypeDoc .normal true 0 keyType)
+            ++ .softline)
+        ++ t "]" ++ t ": " ++ tsTypeDoc .normal true 0 valueType
+
+def tsTypeMemberDocsOf (quoteAll : Bool) : List MiniTsTypeMember → List Doc
+  | [] => []
+  | m :: rest => tsTypeMemberDoc quoteAll m :: tsTypeMemberDocsOf quoteAll rest
+
+/-- One entry of an `extends` clause of an interface, or of the
+`implements` clause of a class. -/
+def tsHeritageDoc : MiniTsHeritage → Doc
+  | ⟨name, args⟩ => tsEntityDoc name ++ tsTypeArgsDoc args
+
+def tsHeritageDocs : List MiniTsHeritage → List Doc
+  | [] => []
+  | h :: rest => tsHeritageDoc h :: tsHeritageDocs rest
+
+/-- One member of an `enum`. -/
+def tsEnumMemberDoc (quoteAll : Bool) : MiniTsEnumMember → Doc
+  | ⟨key, init⟩ =>
+    propertyKeyDoc quoteAll key
+      ++ (match init with
+          | none => Doc.nil
+          | some e => t " = " ++ inPosC .arg e (exprCore .none .arg e))
+
+def tsEnumMemberDocsOf (quoteAll : Bool) : List MiniTsEnumMember → List Doc
+  | [] => []
+  | m :: rest => tsEnumMemberDoc quoteAll m :: tsEnumMemberDocsOf quoteAll rest
+
 /-- An expression, without the parentheses its position may require. -/
 def exprCore (atStart : StartCtx) (pos : Pos) : MiniExpr → Doc
   | .ident n => t n.val
@@ -2819,14 +4003,7 @@ def exprCore (atStart : StartCtx) (pos : Pos) : MiniExpr → Doc
   | .newTarget => t "new.target"
   | .importMeta => t "import.meta"
   | .privateName n => t ("#" ++ n.val)
-  -- `super` is not an identifier, so prettier lets the line break in
-  -- front of the access as it does for any other object
-  | .superDot n =>
-      -- the access that a call is made on is laid out as a chain, whose
-      -- one link stays on the line of `super`
-      let called := match pos with | .callee .. => true | _ => false
-      memberDocOf (called || memberInlines pos false false false true)
-        (t "super") (t ("." ++ n.val))
+  | .superDot n => t ("super." ++ n.val)
   | .superIndex i =>
       t "super"
         ++ indexLookupDoc (isNumericLit i) (inPosC .computed i (exprCore .none .computed i))
@@ -2869,7 +4046,7 @@ def exprCore (atStart : StartCtx) (pos : Pos) : MiniExpr → Doc
         let parts := Doc.nest indentWidth (.softline ++ inner) ++ .softline
         if atStart == .awaitArgument then parts else .group parts
       else inner
-  | .call f args =>
+  | .call f typeArgs args =>
       -- a `require` of a module, a module definition and a call of a test
       -- framework keep their arguments on the line of the call
       let parentIsTest := pos == .testCallArg
@@ -2884,7 +4061,8 @@ def exprCore (atStart : StartCtx) (pos : Pos) : MiniExpr → Doc
       -- inside an Angular wrapper keeps an ordinary parameter list
       let docs :=
         if isTestCallOf false f args then testArgDocs ast args else argDocs ast args
-      let argsDoc := argumentsDocMaybeOpen (isLongCurriedCall pos args.length)
+      let argsDoc := tsTypeArgsDoc typeArgs
+        ++ argumentsDocMaybeOpen (isLongCurriedCall pos args.length)
         (stay || isHookCallWithDepsArray args) (isFunctionCompositionArguments args)
         (canHugFirstArg args)
         (canHugLastArg args) docs (argHugFirstDocs ast false args) (argHugDocs ast false args)
@@ -2915,7 +4093,7 @@ def exprCore (atStart : StartCtx) (pos : Pos) : MiniExpr → Doc
         ++ indexLookupDoc (isNumericLit i) (inPosC .computed i (exprCore .none .computed i))
   | .chain base links =>
       let bpos := chainBasePos pos links
-      chainAssemble pos
+      chainAssemble (chainIsOptional links) pos
         ((if isChainSpine base then
             chainItemsOf bpos atStart (chainMergesBase links)
               (links.toList.any chainLinkIsCall) base
@@ -2955,17 +4133,17 @@ def exprCore (atStart : StartCtx) (pos : Pos) : MiniExpr → Doc
             (canHugLastArg args) [specDoc, oDoc]
             [inPosC pFirst spec (exprCore .none pFirst spec), oDoc]
             [specDoc, inPosC pLast o (exprCore .none pLast o)])
-  | .classExpr decorators name heritage body =>
+  | .classExpr decorators name typeParams heritage implements_ body =>
       let ofAssign := match pos with | .assignRhs _ _ a _ => a | _ => false
-      classDocOf (decoratorDocs decorators) name
-        (match heritage with
-          | none => false
-          | some e => !ofAssign && heritageIsMember e)
+      classDocOf (decoratorDocs decorators) false name (tsTypeParamsDocOf false typeParams)
+        (classHeritageGroupMode ofAssign heritage implements_)
         (match heritage with
           | none => Doc.nil
-          | some e =>
+          | some ⟨he, hargs⟩ =>
             superClassDoc ofAssign
-              (inPosC .classHeritage e (exprCore .none .classHeritage e)))
+              (inPosC .classHeritage he (exprCore .none .classHeritage he)
+                ++ tsTypeArgsDoc hargs))
+        (tsHeritageDocs implements_)
         body (classElemDocsOf (quoteAllMembers body) body)
   | .seq l r =>
       -- the operands after the first of a comma operator that is an
@@ -3035,10 +4213,6 @@ def exprCore (atStart : StartCtx) (pos : Pos) : MiniExpr → Doc
         -- is written as the alternate of one
         let chainTail := altIsTernary || inAlternate
         let bigTabs := 2 < tabWidth || Options.useTabs
-        -- whether the conditional stands in the `{ }` of a JSX element:
-        -- prettier asks that the chain this conditional belongs to is
-        -- written in such a `{ }`, and that the conditional itself is not
-        -- the one straight inside the `{ }` of an attribute
         let inChain := parentIsTernary && !inTest
         let inheritedJsx :=
           match pos with
@@ -3102,7 +4276,11 @@ def exprCore (atStart : StartCtx) (pos : Pos) : MiniExpr → Doc
             .group (.nest indentWidth altBody
               ++ (if jsxRoot && !shortCons then .softline else .nil))
         let memberParent := match pos with | .memberObject false _ _ => true | _ => false
-        let chainRootAssign := extraIndentRoot pos && (isMemberObjectPos pos || isCalleePos pos)
+        let chainRootAssign :=
+          (extraIndentRoot pos && (isMemberObjectPos pos || isCalleePos pos))
+            || (match pos with
+                | .tsTypeOperand extra | .tsNonNullArg extra => extra
+                | _ => false)
         -- a chain of conditionals always breaks
         let forced := consIsTernary || altIsTernary
         let body : Doc :=
@@ -3149,7 +4327,14 @@ def exprCore (atStart : StartCtx) (pos : Pos) : MiniExpr → Doc
         else testDoc
       -- the chain that holds the conditional stands where prettier
       -- indents the whole of it inside the parentheses it needs
-      let extraIndent := extraIndentRoot pos && (isMemberObjectPos pos || isCalleePos pos)
+      let extraIndent :=
+        (extraIndentRoot pos && (isMemberObjectPos pos || isCalleePos pos))
+          -- a conditional written as the expression of an `as`, or of a
+          -- `!`, stands on lines of its own inside the parentheses it
+          -- needs there
+          || (match pos with
+              | .tsTypeOperand extra | .tsNonNullArg extra => extra
+              | _ => false)
       let atRoot := (match pos with | .ternaryTest .. => true | _ => false) || extraIndent
       if jsxMode then
         -- each branch which is neither `null` nor a further conditional
@@ -3193,16 +4378,20 @@ def exprCore (atStart : StartCtx) (pos : Pos) : MiniExpr → Doc
       let result := if inChain then body else Doc.group body
       if atRoot then .group (.nest indentWidth (.softline ++ result) ++ .softline)
       else result
-  | .arrow isAsync params body =>
+  | .arrow isAsync typeParams params retType body =>
       -- an arrow function expanded in place as the argument of a call is
       -- not laid out as a chain, and its parameter list keeps its line
       let expanded := (match pos with | .hugArg .. => true | _ => false) || pos == .hugArrowBody
       let sig :=
         let d := t (if isAsync then "async " else "")
-          ++ arrowParamsDocOf params (paramDocs params)
+          ++ arrowSignatureOf typeParams (tsTypeParamsDocOf true typeParams) params
+              (paramDocs params) retType (tsArrowAnnotation retType)
         -- the parameters of an arrow written as the argument of a call of
-        -- a test framework stay on the line of the call
-        if expanded || pos == .testCallArg then Doc.removeLines d else d
+        -- a test framework stay on the line of the call.  An arrow that
+        -- takes no parameter at all keeps its layout: there is no
+        -- parameter list to write on one line, and its type parameters
+        -- break as they do anywhere else
+        if (expanded || pos == .testCallArg) && !params.isEmpty then Doc.removeLines d else d
       -- an arrow function written straight inside a `{ }` of a JSX
       -- element leaves the closing brace its own line once it breaks
       let jsxParent := pos == .jsxAttrExpr || pos == .jsxChildExpr
@@ -3216,25 +4405,28 @@ def exprCore (atStart : StartCtx) (pos : Pos) : MiniExpr → Doc
         arrowLayoutOf pos false true [sig]
           (arrowBodyDoc false false (atStart == .jsxCallArg) jsxParent
             (if expanded then .hugArrowBody else .arrowBody) body)
-  | .func isAsync isGen name params body =>
+  | .func isAsync isGen name typeParams params retType body =>
       functionDocOf
         (pos == .testCallArg ||
           match pos with
           | .hugArg sole newExpr first =>
               !newExpr && !first && (!sole || params.all paramIsPlainIdent)
           | _ => false)
-        isAsync isGen name params (paramDocs params) body
+        isAsync isGen name typeParams (tsTypeParamsDocOf false typeParams) params
+        (paramDocs params) retType (tsAnnotation retType) (some body)
         (Doc.joinWith .hardline (statementDocs true true body))
-  | .new callee args =>
+  | .new callee typeArgs args =>
       t "new "
         ++ parenIfExpr (!newCalleeOk callee) callee (exprCore .none .newCallee callee)
+        ++ tsTypeArgsDoc typeArgs
         ++ argumentsDoc (isHookCallWithDepsArray args) (isFunctionCompositionArguments args) (canHugFirstArg args)
         (canHugLastArg args) (argDocs .none args) (argHugFirstDocs .none true args) (argHugDocs .none true args)
   | .spread e => t "..." ++ inPosC .spreadArg e (exprCore .none .spreadArg e)
-  | .template tag head parts =>
+  | .template tag typeArgs head parts =>
       (match tag with
         | none => Doc.nil
         | some tg => inPosStartC atStart .templateTag tg (exprCore atStart .templateTag tg))
+        ++ (match tag with | none => Doc.nil | some _ => tsTypeArgsDoc typeArgs)
         ++ t "`" ++ t (encodeTemplateText head) ++ templatePartsAux .nil parts ++ t "`"
   | .unary op e =>
       t (unaryOpText op)
@@ -3250,6 +4442,33 @@ def exprCore (atStart : StartCtx) (pos : Pos) : MiniExpr → Doc
   | .yield none => t "yield"
   | .yield (some e) => t "yield " ++ inPosC .yieldArg e (exprCore .none .yieldArg e)
   | .yieldFrom e => t "yield* " ++ inPosC .yieldArg e (exprCore .none .yieldArg e)
+  | .asExpr e ty =>
+      -- where the `as` itself takes the parentheses that break, what it
+      -- holds is written inside them as it is written anywhere else: only
+      -- one of the two takes lines of its own
+      let operandPos : Pos :=
+        .tsTypeOperand (extraIndentRoot pos && !tsTypeExprBreaksInParens pos)
+      let d := inPosStartC atStart operandPos e (exprCore atStart operandPos e)
+        ++ t " as " ++ tsTypeDoc .normal true 0 ty
+      if tsTypeExprBreaksInParens pos then
+        .group (.nest indentWidth (.softline ++ d) ++ .softline)
+      else d
+  | .satisfies e ty =>
+      let operandPos : Pos :=
+        .tsTypeOperand (extraIndentRoot pos && !tsTypeExprBreaksInParens pos)
+      let d := inPosStartC atStart operandPos e (exprCore atStart operandPos e)
+        ++ t " satisfies " ++ tsTypeDoc .normal true 0 ty
+      if tsTypeExprBreaksInParens pos then
+        .group (.nest indentWidth (.softline ++ d) ++ .softline)
+      else d
+  | .nonNull e =>
+      let operandPos : Pos := .tsNonNullArg (extraIndentRoot pos)
+      inPosStartC atStart operandPos e (exprCore atStart operandPos e) ++ t "!"
+  | .instantiation e typeArgs =>
+      let operandPos : Pos := .tsNonNullArg false
+      let d := inPosStartC atStart operandPos e (exprCore atStart operandPos e)
+        ++ tsTypeArgsDoc typeArgs
+      if ctx.guarded then t "(" ++ d ++ t ")" else d
 
 /-- The operands and operators of a chain of binary operators of the same
 precedence, as the list prettier lays out together. -/
@@ -3300,40 +4519,49 @@ def chainItemsOf (pos : Pos) (atStart : StartCtx) (merge underCall : Bool) :
     MiniExpr → List ChainItem
   | .dot o n =>
       let opos := memberObjectPos false pos
-      (if isChainSpineNode o then chainItemsOf opos atStart false underCall o
+      (if isChainSpineNodeObject o then chainItemsOf opos atStart false underCall o
         else [chainBaseItem o (inPosStartC atStart opos o
                 (exprCore atStart opos o))])
         ++ [{ kind := .dot, doc := t ("." ++ n.val), name := n.val }]
   | .privateDot o n =>
       let opos := memberObjectPos false pos
-      (if isChainSpineNode o then chainItemsOf opos atStart false underCall o
+      (if isChainSpineNodeObject o then chainItemsOf opos atStart false underCall o
         else [chainBaseItem o (inPosStartC atStart opos o
                 (exprCore atStart opos o))])
         ++ [{ kind := .dot, doc := t (".#" ++ n.val), name := n.val }]
+  -- a `!` is an element of the chain, which goes on into the expression
+  -- it is written on
+  | .nonNull e =>
+      let operandPos : Pos := .tsNonNullArg (extraIndentRoot pos)
+      (if isChainSpineNodeObject e then chainItemsOf operandPos atStart false underCall e
+        else [chainBaseItem e (inPosStartC atStart operandPos e
+                (exprCore atStart operandPos e))])
+        ++ [nonNullItem]
   | .index o i =>
       let opos := memberObjectPos true pos
-      (if isChainSpineNode o then chainItemsOf opos atStart false underCall o
+      (if isChainSpineNodeObject o then chainItemsOf opos atStart false underCall o
         else [chainBaseItem o (inPosStartC atStart opos o
                 (exprCore atStart opos o))])
         ++ [{ kind := .index, numericIndex := isNumericLit i,
               doc := indexLookupDoc (isNumericLit i)
                 (inPosC .computed i (exprCore .none .computed i)) }]
-  | .call f args =>
+  | .call f typeArgs args =>
       let cpos := calleePos pos args.length
-      let argsDoc := argumentsDocMaybeOpen (isLongCurriedCall pos args.length)
+      let argsDoc := tsTypeArgsDoc typeArgs
+        ++ argumentsDocMaybeOpen (isLongCurriedCall pos args.length)
         (isHookCallWithDepsArray args) (isFunctionCompositionArguments args) (canHugFirstArg args)
         (canHugLastArg args) (argDocs .none args) (argHugFirstDocs .none false args) (argHugDocs .none false args)
       -- a call whose arguments stay on its line is one element of the
       -- chain, printed as it is anywhere else
       if !underCall && callArgsStayOnLine false false f args then
-        [chainBaseItem (.call f args)
-          (inPosStartC atStart cpos f (exprCore atStart cpos f)
+        [chainBaseItem (.call f typeArgs args)
+          (inPosStartC atStart cpos f (exprCore atStart cpos f) ++ tsTypeArgsDoc typeArgs
             ++ argumentsDoc true false false false
                 (if isTestCallOf false f args then testArgDocs .none args else argDocs .none args) [] [])]
       else if !underCall && !isMemberish f then
         -- the chain starts below this call: it is printed as it is
         -- anywhere else, and the chain of its callee stands inside it
-        [chainBaseItem (.call f args)
+        [chainBaseItem (.call f typeArgs args)
           (let whole := inPosStartC atStart cpos f (exprCore atStart cpos f) ++ argsDoc
             if isCallLikeExpr f then .group whole else whole)]
       else
@@ -3348,24 +4576,30 @@ def chainItemsOf (pos : Pos) (atStart : StartCtx) (merge underCall : Bool) :
       let inner :=
         let innerStart : StartCtx := if merge then atStart else .none
         let innerUnder := hasCallLink || (merge && underCall)
-        (if isChainSpine b then chainItemsOf bpos innerStart (chainMergesBase links) innerUnder b
+        (if isChainSpineObject b then
+            chainItemsOf bpos innerStart (chainMergesBase links) innerUnder b
           else [chainBaseItem b (inPosStartC innerStart bpos b
                   (exprCore innerStart bpos b))])
           ++ chainLinkItemsNE .none links
       if merge then inner
-      else [chainBaseItem (.chain b links) (t "(" ++ chainAssemble .arg inner ++ t ")")]
+      else
+        [chainBaseItem (.chain b links)
+          (t "(" ++ chainAssemble (chainIsOptional links) .arg inner ++ t ")")]
   | e => [chainBaseItem e .nil]
 
 /-- The elements of the links of an optional chain. -/
 def chainLinkItemsNE (lastCtx : StartCtx) (links : NEList MiniChainLink) : List ChainItem :=
-  chainLinkItem (if links.tl.isEmpty then lastCtx else .none) links.hd
-    :: chainLinkItems lastCtx links.tl
+  match links with
+  | ⟨hd, tl⟩ =>
+      chainLinkItem (if linksAllNonNull tl then lastCtx else .none) hd
+        :: chainLinkItems lastCtx tl
 
 /-- The elements of the links of an optional chain. -/
 def chainLinkItems (lastCtx : StartCtx) : List MiniChainLink → List ChainItem
   | [] => []
   | l :: rest =>
-      chainLinkItem (if rest.isEmpty then lastCtx else .none) l :: chainLinkItems lastCtx rest
+      chainLinkItem (if linksAllNonNull rest then lastCtx else .none) l
+        :: chainLinkItems lastCtx rest
 
 /-- The element of one link of an optional chain. -/
 def chainLinkItem (lastCtx : StartCtx) : MiniChainLink → ChainItem
@@ -3379,8 +4613,9 @@ def chainLinkItem (lastCtx : StartCtx) : MiniChainLink → ChainItem
       { kind := .index, numericIndex := isNumericLit i,
         doc := t (if optional then "?." else "")
           ++ indexLookupDoc (isNumericLit i) (inPosC .computed i (exprCore .none .computed i)) }
-  | .call optional args =>
-      chainCallItem args (t (if optional then "?." else "")
+  | .nonNull => nonNullItem
+  | .call optional typeArgs args =>
+      chainCallItem args (t (if optional then "?." else "") ++ tsTypeArgsDoc typeArgs
           ++ argumentsDoc (isHookCallWithDepsArray args) (isFunctionCompositionArguments args) (canHugFirstArg args)
         (canHugLastArg args) (argDocs lastCtx args) (argHugFirstDocs lastCtx false args)
           (argHugDocs lastCtx false args))
@@ -3471,8 +4706,8 @@ def jsxChildDocs : List MiniJSXChild → List JSXChildDoc
 /-- A JSX element or fragment, without the parentheses its position may
 ask for. -/
 def jsxNodeDoc : MiniJSXNode → Doc
-  | .element name attrs children =>
-    let opening := jsxOpeningDocOf name.render children.isNone
+  | .element name typeArgs attrs children =>
+    let opening := jsxOpeningDocOf name.render (tsTypeArgsDoc typeArgs) children.isNone
       (jsxOneStringAttr attrs) (jsxAttrsBreak attrs) (jsxAttrDocs attrs)
     match children with
     | none => opening
@@ -3565,7 +4800,6 @@ def objectPatternPropDocsOf (quoteAll : Bool) : List MiniObjectPatternProp → L
             (patternDoc false value))
         :: objectPatternPropDocsOf quoteAll rest
 
-
 /-- The elements of an array literal; an elision prints as nothing. -/
 def arrayItemDocs : List MiniArrayElement → List Doc
   | [] => []
@@ -3587,7 +4821,9 @@ def templatePartsAux (acc : Doc) : List MiniTemplatePart → Doc
 identifier -- or the plain spelling of a number -- loses its quotes;
 under `"preserve"` it keeps them; and `quoteAll`, which
 `quoteProps: "consistent"` sets when a sibling name cannot lose its
-quotes, quotes every name that can be written quoted. -/
+quotes, quotes every name that can be written quoted.  A name written as
+a number is never quoted: prettier leaves it alone where it reads
+TypeScript. -/
 def propertyKeyDoc (quoteAll : Bool) : MiniPropertyName → Doc
   | .ident n => if quoteAll then t (strLit n.val) else t n.val
   | .private_ n => t ("#" ++ n.val)
@@ -3596,9 +4832,7 @@ def propertyKeyDoc (quoteAll : Bool) : MiniPropertyName → Doc
       else if isIdentifierName v then t v
       else if isSimpleNumberString v then t v
       else t (strLit v)
-  -- a number prettier writes as a quoted name only when it is the plain
-  -- spelling of what it denotes: `1e3` and `0x10` stay as they are
-  | .number n => if quoteAll && isSimpleNumberString n.render then t (strLit n.render) else t n.render
+  | .number n => t n.render
   | .computed e => t "[" ++ inPosC .arg e (exprCore .none .arg e) ++ t "]"
 
 def propertyDoc (quoteAll : Bool) : MiniProperty → Doc
@@ -3610,45 +4844,144 @@ def propertyDoc (quoteAll : Bool) : MiniProperty → Doc
         (inPosC (.propValue false false) v (exprCore .none (.propValue false false) v))
   | .shorthand n => t n.val
   | .spread e => t "..." ++ inPosC .spreadArg e (exprCore .none .spreadArg e)
-  | .method kind key params body =>
-      methodDocOf kind (propertyKeyDoc quoteAll key) params (paramDocs params) body
+  | .method kind key typeParams params retType body =>
+      methodDocOf kind (propertyKeyDoc quoteAll key) Doc.nil (tsTypeParamsDocOf false typeParams)
+        typeParams params (paramDocs params) retType (tsAnnotation retType) (some body)
         (Doc.joinWith .hardline (statementDocs true true body))
 
 def propertyDocsOf (quoteAll : Bool) : List MiniProperty → List Doc
   | [] => []
   | p :: rest => propertyDoc quoteAll p :: propertyDocsOf quoteAll rest
 
-
-/-- One parameter. -/
+/-- One parameter, with its modifiers, its `?` and its type annotation.
+A parameter written with a default value carries its annotation in front
+of the `=`.  Prettier lays an object pattern out together with the `?`
+and the annotation, as one group: the pattern is then what breaks when
+the parameter does not fit, and the annotation may keep its line. -/
 def paramDoc : MiniParam → Doc
-  | .plain p => patternDoc true p
-  | .rest p => t "..." ++ patternDoc true p
+  | .plain decorators mods (.withDefault (.object props rest) v) _ type =>
+      paramDecoratorsDoc (decoratorDocs decorators)
+        (tsParamModsDoc mods
+          ++ .group (sepListOpen "{" "}" true (if rest.isNone then .es5 else .never)
+                (objectPatternPropDocsOf (quoteAllPatternKeys props) props
+                  ++ (match rest with
+                      | none => []
+                      | some r => [t "..." ++ patternDoc false r]))
+              ++ tsAnnotation type)
+          ++ t " = " ++ inPosC .arg v (exprCore .none .arg v))
+  | .plain decorators mods (.withDefault q v) _ type =>
+      paramDecoratorsDoc (decoratorDocs decorators)
+        (tsParamModsDoc mods ++ patternDoc true q ++ tsAnnotation type
+          ++ t " = " ++ inPosC .arg v (exprCore .none .arg v))
+  | .plain decorators mods (.object props rest) isOptional type =>
+      paramDecoratorsDoc (decoratorDocs decorators)
+        (tsParamModsDoc mods
+          ++ .group (sepListOpen "{" "}" true (if rest.isNone then .es5 else .never)
+                (objectPatternPropDocsOf (quoteAllPatternKeys props) props
+                  ++ (match rest with
+                      | none => []
+                      | some r => [t "..." ++ patternDoc false r]))
+              ++ (if isOptional then t "?" else Doc.nil) ++ tsAnnotation type))
+  | .plain decorators mods p isOptional type =>
+      paramDecoratorsDoc (decoratorDocs decorators)
+        (tsParamModsDoc mods ++ patternDoc true p
+          ++ (if isOptional then t "?" else Doc.nil) ++ tsAnnotation type)
+  | .rest decorators (.object props rest) type =>
+      paramDecoratorsDoc (decoratorDocs decorators)
+        (t "..."
+          ++ .group (sepListOpen "{" "}" true (if rest.isNone then .es5 else .never)
+                (objectPatternPropDocsOf (quoteAllPatternKeys props) props
+                  ++ (match rest with
+                      | none => []
+                      | some r => [t "..." ++ patternDoc false r]))
+              ++ tsAnnotation type))
+  | .rest decorators p type =>
+      paramDecoratorsDoc (decoratorDocs decorators)
+        (t "..." ++ patternDoc true p ++ tsAnnotation type)
 
 def paramDocs : List MiniParam → List Doc
   | [] => []
-  | p :: rest => paramDoc p :: paramDocs rest
+  -- the one parameter of a function, written with decorators of its own:
+  -- the parameter list is not hugged then, but the object type of the
+  -- annotation still has no group of its own, so that it breaks together
+  -- with the decorators
+  | [.plain (d :: ds) mods (.ident n) isOptional (some (.objectType members))] =>
+      let items := tsTypeMemberDocsOf (quoteAllTypeMembers members) members
+      let annotation :=
+        t ": " ++ (if items.isEmpty then t "{}"
+          else if mods.isEmpty then tsObjectTypeContent items
+          else .group (tsObjectTypeContent items))
+      [paramDecoratorsDoc (decoratorDocs (d :: ds))
+        (tsParamModsDoc mods ++ patternDoc true (.ident n)
+          ++ (if isOptional then t "?" else Doc.nil) ++ annotation)]
+  -- the one parameter of a function prettier hugs is written without a
+  -- group of its own, and so is its type annotation when that is an
+  -- object type: the two then break together with the parameter list
+  -- rather than on their own
+  | [.plain [] mods p isOptional type] =>
+      let hugged := mods.isEmpty && shouldHugParameter p type
+      let annotation :=
+        match type with
+        | none => Doc.nil
+        | some (.objectType members) =>
+            let items := tsTypeMemberDocsOf (quoteAllTypeMembers members) members
+            t ": " ++ (if items.isEmpty then t "{}"
+              else if hugged then tsObjectTypeContent items
+              else .group (tsObjectTypeContent items))
+        | some ty => t ": " ++ tsTypeDoc .normal true 0 ty
+      match p with
+      | .withDefault q v =>
+          [tsParamModsDoc mods
+            ++ (if hugged then assignTargetPatternDoc q else patternDoc true q)
+            ++ annotation ++ t " = " ++ inPosC .arg v (exprCore .none .arg v)]
+      | q =>
+          [tsParamModsDoc mods
+            ++ (if hugged then assignTargetPatternDoc q else patternDoc true q)
+            ++ (if isOptional then t "?" else Doc.nil) ++ annotation]
+  | p :: rest => paramDoc p :: paramDocsTail rest
+
+/-- The parameters that follow the first one, none of which is hugged:
+prettier only hugs the parameter of a function that takes one. -/
+def paramDocsTail : List MiniParam → List Doc
+  | [] => []
+  | p :: rest => paramDoc p :: paramDocsTail rest
 
 def classElemDoc (quoteAll : Bool) (next : Option MiniClassElement) : MiniClassElement → Doc
-  | .method decorators isStatic kind key params body =>
+  | .method decorators mods kind key isOptional typeParams params retType body =>
       decoratorsPrefix (decoratorDocs decorators)
-        ++ (if isStatic then t "static " else Doc.nil)
-        ++ methodDocOf kind (propertyKeyDoc quoteAll key) params (paramDocs params) body
-            (Doc.joinWith .hardline (statementDocs true true body))
-  | .field decorators isStatic isAccessor key init =>
+        ++ tsMemberModsDoc mods
+        ++ methodDocOf kind (propertyKeyDoc quoteAll key) (if isOptional then t "?" else Doc.nil)
+            (tsTypeParamsDocOf false typeParams) typeParams params (paramDocs params) retType
+            (tsAnnotation retType) body
+            (match body with
+              | none => Doc.nil
+              | some body => Doc.joinWith .hardline (statementDocs true true body))
+  | .field decorators mods isAccessor key isOptional isDefinite type init =>
+      let keyDoc := propertyKeyDoc quoteAll key
+        ++ (if isOptional then t "?" else Doc.nil)
+        ++ (if isDefinite then t "!" else Doc.nil)
+        ++ tsAnnotation type
       -- the decorators stand inside the left hand side of the assignment,
       -- as prettier writes them: a field which has one is a field whose
       -- left hand side holds a line, and so is never one whose value
       -- keeps the line of the `=` whatever it is
       let headDoc := decoratorsPrefix (decoratorDocs decorators)
-        ++ (if isStatic then t "static " else Doc.nil)
+        ++ tsMemberModsDoc mods
         ++ (if isAccessor then t "accessor " else Doc.nil)
       (match init with
-        | none => headDoc ++ propertyKeyDoc quoteAll key
+        | none => headDoc ++ keyDoc
         | some e =>
             let valuePos : Pos := .propValue isAccessor true
-            assignmentDoc false (headDoc ++ propertyKeyDoc quoteAll key) " =" e
+            assignmentDoc false (headDoc ++ keyDoc) " =" e
               (inPosC valuePos e (exprCore .none valuePos e)))
-        ++ fieldSemiDoc key init next
+        ++ fieldSemiDoc key type init next
+  | .indexSig mods name keyType valueType =>
+      tsMemberModsDoc mods
+        -- the brackets of an index signature break around what they hold
+        ++ t "[" ++ .group (.nest indentWidth
+              (.softline ++ t (name.val ++ ": ") ++ tsTypeDoc .normal true 0 keyType)
+            ++ .softline)
+        ++ t "]: " ++ tsTypeDoc .normal true 0 valueType ++ semiDoc
   | .staticBlock body =>
       -- a string literal statement of a static block cannot be read as a
       -- directive, and so is never parenthesised
@@ -3658,13 +4991,6 @@ def classElemDoc (quoteAll : Bool) (next : Option MiniClassElement) : MiniClassE
 def classElemDocsOf (quoteAll : Bool) : List MiniClassElement → List Doc
   | [] => []
   | el :: rest => classElemDoc quoteAll rest.head? el :: classElemDocsOf quoteAll rest
-
-
-/-- The parameter list of an arrow function, which `arrowParens: "avoid"`
-writes without its parentheses when it is one plain name. -/
-def arrowParamsDocOf (params : List MiniParam) (items : List Doc) : Doc :=
-  if arrowParensAvoided params then Doc.concat items
-  else paramsDocOf (shouldHugTheOnlyParameter params) (restLast params) items
 
 /-- The body of an arrow function, with the space or the line in front. -/
 def arrowBodyDoc (chained breakChain jsxArg jsxParent : Bool) (bodyPos : Pos) :
@@ -3679,10 +5005,11 @@ def arrowBodyDoc (chained breakChain jsxArg jsxParent : Bool) (bodyPos : Pos) :
 /-- The signatures of the arrow functions that follow the first one of a
 chain, and the document of the body at the end of the chain. -/
 def arrowChainDocs (breakChain jsxParent : Bool) : MiniArrowBody → List Doc × Doc
-  | .expr (.arrow isAsync ps b) =>
+  | .expr (.arrow isAsync tps ps retType b) =>
       let (sigs, bodyPart) := arrowChainDocs breakChain jsxParent b
       ((t (if isAsync then "async " else "")
-          ++ arrowParamsDocOf ps (paramDocs ps)) :: sigs,
+          ++ arrowSignatureOf tps (tsTypeParamsDocOf true tps) ps (paramDocs ps) retType
+              (tsArrowAnnotation retType)) :: sigs,
         bodyPart)
   | .expr e =>
       ([], arrowExprBodyOf true breakChain false jsxParent e
@@ -3693,19 +5020,21 @@ def arrowChainDocs (breakChain jsxParent : Bool) : MiniArrowBody → List Doc ×
             (Doc.joinWith .hardline (statementDocs true true body)))
 
 def declaratorDoc : MiniDeclarator → Doc
-  | ⟨lhs, init⟩ =>
+  | ⟨lhs, definite, type, init⟩ =>
+      let annotation := (if definite then t "!" else Doc.nil) ++ tsAnnotation type
       match init with
-      | none => patternDoc false lhs
+      | none => patternDoc false lhs ++ annotation
       | some e =>
           -- `const x = (a = 1);`: an assignment used as an initialiser is
           -- parenthesised, which the position it stands in asks for
           let init :=
             inPosC (.assignRhs false false false false) e
               (exprCore .none (.assignRhs false false false false) e)
-          let leftDoc := assignTargetPatternDoc lhs
+          let leftDoc := assignTargetPatternDoc lhs ++ annotation
           let leftCanBreak := Doc.canBreak leftDoc
           let complexLhs :=
             patternIsComplexDestructuring lhs
+              || tsAnnotationIsComplex type
               || (leftCanBreak && (match e with | .arrow .. => true | _ => false))
           assignmentDocOf
             (chooseAssignLayout false false false complexLhs leftCanBreak false e)
@@ -3735,8 +5064,17 @@ def forHeadDoc : MiniForHead → Doc
 
 def switchCaseDoc : MiniSwitchCase → Doc
   | .case test body =>
-      t "case " ++ inPosC .caseTest test (exprCore .none .caseTest test) ++ t ":"
-        ++ caseBodyWith body (statementDocs false false body)
+      -- the test of a `case` is one more place TypeScript may read back
+      -- differently than it was meant (a conditional type inside it ends
+      -- in a `:`, which the parser may take for the one of the `case`),
+      -- so the guarding mode writes parentheses of its own around it.
+      -- They come in pairs: one pair alone is read as the parameters of
+      -- an arrow function whose return type the `:` of the clause opens,
+      -- which is the reading they are there to rule out.
+      let testDoc := inPosC .caseTest test (exprCore .none .caseTest test)
+      t "case "
+        ++ (if ctx.guarded then t "((" ++ testDoc ++ t "))" else testDoc)
+        ++ t ":" ++ caseBodyWith body (statementDocs false false body)
   | .default body => t "default:" ++ caseBodyWith body (statementDocs false false body)
 
 def switchCaseDocs : List MiniSwitchCase → List Doc
@@ -3744,8 +5082,8 @@ def switchCaseDocs : List MiniSwitchCase → List Doc
   | c :: rest => switchCaseDoc c :: switchCaseDocs rest
 
 def catchDoc (collapseEmpty : Bool) : MiniCatchClause → Doc
-  | ⟨param, guard, body⟩ =>
-      t " catch (" ++ patternDoc true param
+  | ⟨param, type, guard, body⟩ =>
+      t " catch (" ++ patternDoc true param ++ tsAnnotation type
         ++ (match guard with
             | none => Doc.nil
             | some g => t " if " ++ inPosC .ifTest g (exprCore .none .ifTest g))
@@ -3779,17 +5117,20 @@ def statementDoc (collapseEmpty inList : Bool) : MiniStatement → Doc
   | .break_ (some l) => t ("break " ++ l.val) ++ semiDoc
   | .continue_ none => t "continue" ++ semiDoc
   | .continue_ (some l) => t ("continue " ++ l.val) ++ semiDoc
-  | .classDecl decorators name heritage body =>
+  | .classDecl decorators isAbstract name typeParams heritage implements_ body =>
       -- prettier puts a decorated declaration and its decorators in a
       -- group of their own, which the decorators then break; a decorated
       -- class *expression* is left ungrouped, and so keeps its decorators
       -- on its line where the line around it is laid out flat
       (if decorators.isEmpty then id else Doc.group)
-        (classDocOf (decoratorDocs decorators) (some name)
-          (match heritage with | none => false | some e => heritageIsMember e)
+        (classDocOf (decoratorDocs decorators) isAbstract (some name)
+          (tsTypeParamsDocOf false typeParams)
+          (classHeritageGroupMode false heritage implements_)
           (match heritage with
             | none => Doc.nil
-            | some e => inPosC .classHeritage e (exprCore .none .classHeritage e))
+            | some ⟨he, hargs⟩ => inPosC .classHeritage he (exprCore .none .classHeritage he)
+                ++ tsTypeArgsDoc hargs)
+          (tsHeritageDocs implements_)
           body (classElemDocsOf (quoteAllMembers body) body))
   | .decl kind ⟨hd, tl⟩ =>
       declarationDoc kind false (hd.init.isSome || tl.any (fun d => d.init.isSome))
@@ -3802,8 +5143,8 @@ def statementDoc (collapseEmpty inList : Bool) : MiniStatement → Doc
   | .doWhile body cond =>
       .group (t "do" ++ bodyClauseWith body (statementDoc true false body))
         ++ (if isBlockStmt body then t " " else .hardline)
-        ++ t "while (" ++ conditionWith cond (inPosC .ifTest cond (exprCore .none .ifTest cond)) ++ t ")"
-        ++ semiDoc
+        ++ t "while (" ++ conditionWith cond (inPosC .ifTest cond (exprCore .none .ifTest cond))
+        ++ t ")" ++ semiDoc
   | .for_ init cond step body =>
       let noHead := (match init with | .none => true | _ => false)
         && cond.isNone && step.isNone
@@ -3829,9 +5170,13 @@ def statementDoc (collapseEmpty inList : Bool) : MiniStatement → Doc
       .group (t (if isAwait then "for await (" else "for (") ++ forHeadDoc head ++ t " of "
         ++ inPosC .forInObject obj (exprCore .none .forInObject obj) ++ t ")"
           ++ bodyClauseWith body (statementDoc false false body))
-  | .funcDecl isAsync isGen name params body =>
-      functionDocOf false isAsync isGen (some name) params (paramDocs params) body
-        (Doc.joinWith .hardline (statementDocs true true body))
+  | .funcDecl isAsync isGen name typeParams params retType body =>
+      functionDocOf false isAsync isGen (some name) typeParams
+        (tsTypeParamsDocOf false typeParams) params (paramDocs params) retType
+        (tsAnnotation retType) body
+        (match body with
+          | none => Doc.nil
+          | some b => Doc.joinWith .hardline (statementDocs true true b))
   | .if_ cond thenS elseS =>
       -- `if (a) { if (b) c; } else d`: the consequent is written in a
       -- block when it could swallow the `else`
@@ -3869,12 +5214,8 @@ def statementDoc (collapseEmpty inList : Bool) : MiniStatement → Doc
       if !outer && (needsStatementParens e || directiveLike) then parens d ++ semiDoc
       else d ++ semiDoc
   | .return_ none => t "return" ++ semiDoc
-  | .return_ (some e) =>
-      t "return " ++ returnArgWith e (inPosC .returnThrow e (exprCore .none .returnThrow e))
-        ++ semiDoc
-  | .throw e =>
-      t "throw " ++ returnArgWith e (inPosC .returnThrow e (exprCore .none .returnThrow e))
-        ++ semiDoc
+  | .return_ (some e) => t "return " ++ returnArgWith e (inPosC .returnThrow e (exprCore .none .returnThrow e)) ++ semiDoc
+  | .throw e => t "throw " ++ returnArgWith e (inPosC .returnThrow e (exprCore .none .returnThrow e)) ++ semiDoc
   | .switch disc cases =>
       .group (t "switch ("
           ++ .nest indentWidth (.softline ++ inPosC .ifTest disc (exprCore .none .ifTest disc))
@@ -3893,6 +5234,83 @@ def statementDoc (collapseEmpty inList : Bool) : MiniStatement → Doc
       .group (t "with ("
         ++ conditionWith obj (inPosC .withObject obj (exprCore .none .withObject obj))
         ++ t ")" ++ bodyClauseWith body (statementDoc false false body))
+  | .typeAlias name typeParams type =>
+      -- a union on the right of the `=` is laid out the way prettier lays
+      -- out an assignment it breaks after the operator: the members of the
+      -- union are not indented again
+      let breakAfter :=
+        match type with
+        | .union types => !tsUnionShouldHug types
+        -- a conditional type whose check or `extends` type is written
+        -- with type arguments stands below the `=`; under
+        -- `experimentalTernaries` every conditional type does
+        | .conditional check ext _ _ =>
+            Options.experimentalTernaries ||
+              let parameterised : MiniTsType → Bool
+                | .ref _ (_ :: _) => true
+                | .fn (_ :: _) _ _ => true
+                | _ => false
+              parameterised check || parameterised ext
+        | _ => false
+      -- several type parameters of which one is written with a constraint
+      -- or with a default break before the `=` does
+      let complexParams :=
+        1 < typeParams.length
+          && typeParams.any (fun tp => tp.constraint.isSome || tp.default_.isSome)
+      assignmentDocOf
+          (if breakAfter then .breakAfterOperator
+            else if complexParams then .breakLhs else .fluid)
+          (t ("type " ++ name.val) ++ tsTypeParamsDocOf false typeParams) " ="
+          (tsTypeDoc .normal (!breakAfter) 0 type)
+        ++ semiDoc
+  | .interface_ name typeParams extends_ members =>
+      let head := t ("interface " ++ name.val) ++ tsTypeParamsDocOf false typeParams
+      let bodyDoc := tsInterfaceBodyDoc (tsTypeMemberDocsOf (quoteAllTypeMembers members) members)
+      if extends_.isEmpty then head ++ t " " ++ bodyDoc
+      else
+        let clause :=
+          .group (t "extends"
+            ++ .nest indentWidth
+                (.line ++ Doc.joinWith (t "," ++ .line) (tsHeritageDocs extends_)))
+        -- an interface which extends one thing keeps `extends` on the
+        -- line of its name, however long the name that follows it is;
+        -- one which extends several writes the clause on a line of its
+        -- own once the line is too long
+        if extends_.length == 1 then
+          head ++ t " extends "
+            ++ Doc.concat (tsHeritageDocs extends_) ++ t " " ++ bodyDoc
+        else
+          .condGroup (head ++ t " " ++ clause ++ t " " ++ bodyDoc)
+            (head ++ .nest indentWidth (.hardline ++ clause) ++ t " " ++ bodyDoc)
+  | .enum_ isConst name members =>
+      t ((if isConst then "const enum " else "enum ") ++ name.val ++ " ")
+        ++ (if members.isEmpty then t "{}"
+            else
+              t "{" ++ .nest indentWidth
+                  (.hardline
+                    ++ Doc.joinWith (t "," ++ .hardline)
+                        (tsEnumMemberDocsOf (quoteAllEnumMembers members) members)
+                    ++ (if Options.hasTrailingComma .es5 then t "," else .nil))
+                ++ .hardline ++ t "}")
+  | .namespaceDecl isModuleKeyword name body =>
+      let headDoc :=
+        match name with
+        | .qualified names =>
+            t ((if isModuleKeyword then "module " else "namespace ")
+              ++ String.intercalate "." (names.toList.map (fun n => n.val)))
+        | .str v => t ("module " ++ strLit v)
+        | .global => t "global"
+      match body with
+      -- `declare module "foo";`, an ambient module with no body at all
+      | none => headDoc ++ semiDoc
+      | some body =>
+        headDoc ++ t " "
+          ++ (if body.all isEmptyItem then t "{}"
+              else
+                t "{" ++ .nest indentWidth
+                    (.hardline ++ Doc.joinWith .hardline (namespaceItemDocs body))
+                  ++ .hardline ++ t "}")
+  | .declare_ s => t "declare " ++ statementDoc false false s
 
 /-- The statements of a body; the empty statement is dropped.  `inList`
 says whether the statements are those of a program or of a block, where a
@@ -3907,16 +5325,121 @@ def statementDocs (inList prologue : Bool) : List MiniStatement → List Doc
       asiGuard s (statementDoc false (inList && !directive) s)
         :: statementDocs inList directive rest
 
+/-- An `export` declaration. -/
+def exportDoc : MiniExportDeclaration → Doc
+  | .fromClause isType specs mod attrs =>
+      t "export " ++ (if isType then t "type " else Doc.nil) ++ specifiersDoc specs
+        ++ t (" from " ++ strLit mod.val) ++ importAttrsDoc attrs ++ semiDoc
+  | .locals isType specs =>
+      t "export " ++ (if isType then t "type " else Doc.nil) ++ specifiersDoc specs ++ semiDoc
+  | .all isType alias_ mod attrs =>
+      t "export " ++ (if isType then t "type " else Doc.nil) ++ t "*"
+        ++ (match alias_ with | none => Doc.nil | some n => t (" as " ++ n.val))
+        ++ t (" from " ++ strLit mod.val) ++ importAttrsDoc attrs ++ semiDoc
+  -- `export default function () {}` and `export default class {}` are
+  -- declarations, which take no semicolon; anything whose leftmost token
+  -- opens a function or a class is parenthesised, so that it is not read
+  -- as one of them
+  | .defaultExpr (.func isAsync isGen name typeParams params retType body) =>
+      t "export default "
+        ++ functionDocOf false isAsync isGen name typeParams
+            (tsTypeParamsDocOf false typeParams) params (paramDocs params) retType
+            (tsAnnotation retType) (some body)
+            (Doc.joinWith .hardline (statementDocs true true body))
+  -- the decorators of an exported class stand on their own line, below
+  -- the `export` keyword
+  | .defaultExpr (.classExpr decorators name typeParams heritage implements_ body) =>
+      t "export default" ++ (if decorators.isEmpty then t " " else Doc.hardline)
+        ++ classDocOf (decoratorDocs decorators) false name (tsTypeParamsDocOf false typeParams)
+            (classHeritageGroupMode false heritage implements_)
+            (match heritage with
+              | none => Doc.nil
+              | some ⟨he, hargs⟩ => inPosC .classHeritage he (exprCore .none .classHeritage he)
+                  ++ tsTypeArgsDoc hargs)
+            (tsHeritageDocs implements_) body (classElemDocsOf (quoteAllMembers body) body)
+  | .defaultExpr e =>
+      t "export default "
+        ++ parenIfExpr (needsParens .generic e || startsWithFunctionOrClass e) e
+            (exprCore .none .generic e)
+        ++ semiDoc
+  -- `export default abstract class A {}` and `export default interface I {}`,
+  -- the declarations that are no expression
+  | .defaultDecl (.classDecl decorators isAbstract name typeParams heritage implements_ body) =>
+      t "export default" ++ (if decorators.isEmpty then t " " else Doc.hardline)
+        ++ classDocOf (decoratorDocs decorators) isAbstract (some name)
+            (tsTypeParamsDocOf false typeParams)
+            (classHeritageGroupMode false heritage implements_)
+            (match heritage with
+              | none => Doc.nil
+              | some ⟨he, hargs⟩ => inPosC .classHeritage he (exprCore .none .classHeritage he)
+                  ++ tsTypeArgsDoc hargs)
+            (tsHeritageDocs implements_) body (classElemDocsOf (quoteAllMembers body) body)
+  | .defaultDecl s => t "export default " ++ statementDoc false false s
+  | .decl (.classDecl decorators isAbstract name typeParams heritage implements_ body) =>
+      t "export" ++ (if decorators.isEmpty then t " " else Doc.hardline)
+        ++ classDocOf (decoratorDocs decorators) isAbstract (some name)
+            (tsTypeParamsDocOf false typeParams)
+            (classHeritageGroupMode false heritage implements_)
+            (match heritage with
+              | none => Doc.nil
+              | some ⟨he, hargs⟩ => inPosC .classHeritage he (exprCore .none .classHeritage he)
+                  ++ tsTypeArgsDoc hargs)
+            (tsHeritageDocs implements_) body (classElemDocsOf (quoteAllMembers body) body)
+  | .decl s => t "export " ++ statementDoc false false s
+  | .assign e =>
+      t "export = " ++ inPosC .tsExportAssign e (exprCore .none .tsExportAssign e) ++ semiDoc
+  | .asNamespace n => t ("export as namespace " ++ n.val) ++ semiDoc
+
+/-- One item of a program.  `inList` says that a string literal statement
+here is no longer one of the directives of the program, and so is
+parenthesised. -/
+def moduleItemDoc (inList : Bool) : MiniModuleItem → Doc
+  | .stmt s => asiGuard s (statementDoc false inList s)
+  | .importDecl d => importDoc d
+  | .exportDecl d => exportDoc d
+
+/-- The documents of the items of a program.  `prologue` says whether a
+string literal statement here is still one of the directives of the
+program. -/
+def moduleItemDocs (prologue : Bool) : List MiniModuleItem → List Doc
+  | [] => []
+  | i :: rest =>
+      if isEmptyItem i then moduleItemDocs prologue rest
+      else
+        let directive := prologue && isStringItem i
+        moduleItemDoc (!directive) i :: moduleItemDocs directive rest
+
+/-- The documents of the items of the body of a namespace or of a module
+declaration.  A string literal statement there is no directive, and is
+not read back as one either, so prettier writes it with no parentheses
+of its own wherever it stands. -/
+def namespaceItemDocs : List MiniModuleItem → List Doc
+  | [] => []
+  | i :: rest =>
+      if isEmptyItem i then namespaceItemDocs rest
+      else moduleItemDoc false i :: namespaceItemDocs rest
+
 end
 end
 
 /-- The head of a `for (;;)`: the place where prettier parenthesises every
 `in` operator written in it. -/
-partial def forInitHeadDoc (init : MiniForInit) : Doc :=
-  forInitDoc { inForInit := true, forInit := forInitHeadDoc } init
+partial def forInitHeadDocOf (guard : Bool) (init : MiniForInit) : Doc :=
+  forInitDoc
+    { inForInit := true, guarded := guard, forInit := forInitHeadDocOf guard }
+    init
+
+/-- The head of a `for (;;)`, printed in the ordinary mode. -/
+def forInitHeadDoc (init : MiniForInit) : Doc := forInitHeadDocOf false init
 
 /-- The context anything outside the head of a `for (;;)` is printed in. -/
 def topCtx : PrintCtx := { inForInit := false, forInit := forInitHeadDoc }
+
+/-- The context of the mode which writes the parentheses that say what
+the text means. -/
+def guardCtx : PrintCtx :=
+  { inForInit := false, guarded := true,
+    forInit := forInitHeadDocOf true }
 
 
 /-! ### Document builders for AST nodes -/
@@ -3938,12 +5461,14 @@ def argsDoc (args : List MiniExpr) : Doc :=
 
 /-- A parameter list. -/
 def paramsDoc (params : List MiniParam) : Doc :=
-  paramsDocOf (shouldHugTheOnlyParameter params) (restLast params) (paramDocs topCtx params)
+  paramListDocOf params (paramDocs topCtx params)
+
+/-- A type expression. -/
+def typeDoc (ty : MiniTsType) : Doc := tsTypeDoc topCtx .normal true 0 ty
 
 def arrayDoc (els : List MiniArrayElement) : Doc := arrayDocOf els (arrayItemDocs topCtx els)
 
-def classBodyDoc (body : List MiniClassElement) : Doc :=
-  classBodyOf body (classElemDocsOf topCtx (quoteAllMembers body) body)
+def classBodyDoc (body : List MiniClassElement) : Doc := classBodyOf body (classElemDocsOf topCtx (quoteAllMembers body) body)
 
 def classElementDoc (el : MiniClassElement) : Doc := classElemDoc topCtx false none el
 
@@ -3953,24 +5478,28 @@ def patternDocOf (p : MiniPattern) : Doc := patternDoc topCtx false p
 /-- One decorator, `@expr`. -/
 def decoratorDoc (e : MiniExpr) : Doc := t "@" ++ exprDoc .decorator e
 
-def classDoc (decorators : List MiniExpr) (name : Option NEString)
-    (heritage : Option MiniExpr) (body : List MiniClassElement) : Doc :=
-  classDocOf (decoratorDocs topCtx decorators) name
-    (match heritage with | none => false | some e => heritageIsMember e)
+def classDoc (decorators : List MiniExpr) (isAbstract : Bool) (name : Option NEString)
+    (typeParams : List MiniTsTypeParam) (heritage : Option MiniClassHeritage)
+    (implements_ : List MiniTsHeritage) (body : List MiniClassElement) : Doc :=
+  classDocOf (decoratorDocs topCtx decorators) isAbstract name
+    (tsTypeParamsDocOf topCtx false typeParams)
+    (classHeritageGroupMode false heritage implements_)
     (match heritage with
       | none => Doc.nil
-      | some e => exprDoc .classHeritage e)
+      | some h => exprDoc .classHeritage h.expr ++ tsTypeArgsDoc topCtx h.typeArgs)
+    (tsHeritageDocs topCtx implements_)
     body (classElemDocsOf topCtx (quoteAllMembers body) body)
 
 def methodDoc (kind : MethodKind) (key : MiniPropertyName)
     (params : List MiniParam) (body : List MiniStatement) : Doc :=
-  methodDocOf kind (propertyKeyDoc topCtx false key) params (paramDocs topCtx params) body
+  methodDocOf kind (propertyKeyDoc topCtx false key) Doc.nil Doc.nil [] params
+    (paramDocs topCtx params) none Doc.nil (some body)
     (Doc.joinWith .hardline (statementDocs topCtx true true body))
 
 def functionDoc (isAsync isGen : Bool) (name : Option NEString)
     (params : List MiniParam) (body : List MiniStatement) : Doc :=
-  functionDocOf false isAsync isGen name params (paramDocs topCtx params) body
-    (Doc.joinWith .hardline (statementDocs topCtx true true body))
+  functionDocOf false isAsync isGen name [] Doc.nil params (paramDocs topCtx params) none Doc.nil
+    (some body) (Doc.joinWith .hardline (statementDocs topCtx true true body))
 
 /-- A statement list, one statement per line. -/
 def statementsDoc (body : List MiniStatement) : Doc :=
@@ -3983,122 +5512,13 @@ def blockDoc (body : List MiniStatement) : Doc :=
 /-- The name of a property or of a method. -/
 def propertyNameDoc (k : MiniPropertyName) : Doc := propertyKeyDoc topCtx false k
 
-/-! ## Modules -/
-
-def specifierDoc (s : Specifier) : Doc :=
-  t s.name.val ++ (match s.alias_ with | none => Doc.nil | some a => t (" as " ++ a.val))
-
-/-- The `{ a, b as c }` of an import or export clause.  A clause of
-exactly one named specifier which stands alone -- with no default and no
-namespace specifier beside it -- is never broken, however long the line
-becomes; every other clause is a list which breaks one specifier to a
-line.  `withStandalone` says whether a default or namespace specifier
-stands beside these. -/
-def specifiersDoc (specs : List Specifier) (withStandalone : Bool := false) : Doc :=
-  match specs with
-  | [sp] => if withStandalone then sepList "{" "}" true .es5 [specifierDoc sp]
-            else
-              let pad := if Options.bracketSpacing then " " else ""
-              t ("{" ++ pad) ++ specifierDoc sp ++ t (pad ++ "}")
-  | _ => sepList "{" "}" true .es5 (specs.map specifierDoc)
-
-/-- The `with { type: "json" }` of an import; nothing when there is no
-attribute.  The one attribute `type`, whose value is a string, is the one
-every engine knows, and prettier keeps it on the line of the import
-however long that line becomes; any other list of attributes is laid out
-as an object literal is. -/
-def importAttrsDoc (attrs : List ImportAttr) : Doc :=
-  if attrs.isEmpty then Doc.nil
-  else
-    -- the attributes are names of an object as far as `quoteProps` is
-    -- concerned: one of them that cannot lose its quotes quotes them all
-    let quoteAll := Options.quoteProps == .consistent
-      && attrs.any fun a => !isIdentifierName a.key && !isSimpleNumberString a.key
-    let items := attrs.map fun a =>
-      t ((if !quoteAll && isIdentifierName a.key then a.key else strLit a.key)
-        ++ ": " ++ strLit a.value)
-    let listDoc := sepList "{" "}" true .es5 items
-    let isTypeOnly := match attrs with | [a] => a.key == "type" | _ => false
-    t " with " ++ (if isTypeOnly then Doc.removeLines listDoc else listDoc)
-
-def importDoc : MiniImportDeclaration → Doc
-  | .bare mod attrs =>
-      t ("import " ++ strLit mod.val) ++ importAttrsDoc attrs ++ semiDoc
-  | .clause c =>
-      let standalone : List Doc :=
-        (match c.default_ with | none => [] | some d => [t d.val])
-        ++ (match c.namespace_ with | none => [] | some n => [t ("* as " ++ n.val)])
-      let parts : List Doc :=
-        standalone
-        -- an empty list of named imports is written out only when it is
-        -- the whole clause: `import d, {} from "m"` binds `d` alone
-        ++ (match c.named with
-            | none => []
-            | some [] => if standalone.isEmpty then [specifiersDoc []] else []
-            | some specs => [specifiersDoc specs !standalone.isEmpty])
-      t "import " ++ Doc.joinWith (t ", ") parts
-        ++ t (" from " ++ strLit c.mod.val) ++ importAttrsDoc c.attrs ++ semiDoc
-
-def exportDoc : MiniExportDeclaration → Doc
-  | .fromClause specs mod attrs =>
-      t "export " ++ specifiersDoc specs ++ t (" from " ++ strLit mod.val)
-        ++ importAttrsDoc attrs ++ semiDoc
-  | .locals specs => t "export " ++ specifiersDoc specs ++ semiDoc
-  | .all alias_ mod attrs =>
-      t "export *"
-        ++ (match alias_ with | none => Doc.nil | some n => t (" as " ++ n.val))
-        ++ t (" from " ++ strLit mod.val) ++ importAttrsDoc attrs ++ semiDoc
-  -- `export default function () {}` and `export default class {}` are
-  -- declarations, which take no semicolon; anything whose leftmost token
-  -- opens a function or a class is parenthesised, so that it is not read
-  -- as one of them
-  | .defaultExpr (.func isAsync isGen name params body) =>
-      t "export default " ++ functionDoc isAsync isGen name params body
-  -- the decorators of an exported class stand on their own line, below
-  -- the `export` keyword
-  | .defaultExpr (.classExpr decorators name heritage body) =>
-      t "export default" ++ (if decorators.isEmpty then t " " else Doc.hardline)
-        ++ classDoc decorators name heritage body
-  | .defaultExpr e =>
-      t "export default "
-        ++ parenIfExpr (needsParens .generic e || startsWithFunctionOrClass e) e
-            (exprCore topCtx .none .generic e)
-        ++ semiDoc
-  | .decl (.classDecl decorators name heritage body) =>
-      t "export" ++ (if decorators.isEmpty then t " " else Doc.hardline)
-        ++ classDoc decorators (some name) heritage body
-  | .decl s => t "export " ++ statementDoc topCtx false false s
-
-/-- One item of a program.  `inList` says that a string literal statement
-here is no longer one of the directives of the program, and so is
-parenthesised. -/
-def moduleItemDoc (inList : Bool) : MiniModuleItem → Doc
-  | .stmt s => asiGuard s (statementDoc topCtx false inList s)
-  | .importDecl d => importDoc d
-  | .exportDecl d => exportDoc d
-
-/-- Whether the item is a string literal statement, which is a directive
-where a program starts. -/
-def isStringItem : MiniModuleItem → Bool
-  | .stmt s => isStringStmt s
-  | _ => false
-
-/-- The documents of the items of a program.  `prologue` says whether a
-string literal statement here is still one of the directives of the
-program. -/
-def moduleItemDocs (prologue : Bool) : List MiniModuleItem → List Doc
-  | [] => []
-  | i :: rest =>
-      let directive := prologue && isStringItem i
-      moduleItemDoc (!directive) i :: moduleItemDocs directive rest
-
-/-- Whether the item is an empty statement, which prettier drops. -/
-def isEmptyItem : MiniModuleItem → Bool
-  | .stmt s => isEmptyStmt s
-  | _ => false
-
 def programDoc (p : MiniProgram) : Doc :=
-  Doc.joinWith .hardline (moduleItemDocs true (p.items.filter (fun i => !isEmptyItem i)))
+  Doc.joinWith .hardline (moduleItemDocs topCtx true (p.items.filter (fun i => !isEmptyItem i)))
+
+/-- A program printed with the parentheses that make TypeScript read the
+text back as the tree it was printed from. -/
+def programGuardedDoc (p : MiniProgram) : Doc :=
+  Doc.joinWith .hardline (moduleItemDocs guardCtx true (p.items.filter (fun i => !isEmptyItem i)))
 
 end Printer
 
@@ -4137,6 +5557,24 @@ def printFileWidth (interpreter : Option String) (width : Nat) (p : MiniProgram)
 def printProgramWidth (width : Nat) (p : MiniProgram) : String :=
   printFileWidth none width p
 
+/-- Print a program, under the given options, with the parentheses which
+say what it means where TypeScript would otherwise read the text back as
+another tree: around an instantiation expression, `f<T>`, and around the
+test of a `case`.  The text is not the canonical one — prettier writes no
+such parentheses — but it holds the tree the printer means, which is what
+lets prettier be asked what it writes for that tree. -/
+def printProgramGuardedWith (opts : Options) (interpreter : Option String)
+    (p : MiniProgram) : String :=
+  let eol := opts.endOfLine.text
+  let shebang := match interpreter with | none => "" | some s => "#!" ++ s ++ eol
+  if (p.items.filter (fun i => !Printer.isEmptyItem i)).isEmpty then shebang
+  else shebang ++ renderDoc opts (Printer.programGuardedDoc (o := opts) p) ++ eol
+
+/-- Print a program with those parentheses, at a given line width. -/
+def printProgramGuardedWidth (interpreter : Option String) (width : Nat)
+    (p : MiniProgram) : String :=
+  printProgramGuardedWith { printWidth := width } interpreter p
+
 /-- Print a program in the canonical style: two space indentation, double
 quotes, semicolons, and lines of at most 80 columns. -/
 def printProgram (p : MiniProgram) : String :=
@@ -4163,5 +5601,5 @@ def printExprWith (opts : Options) (e : MiniExpr) : String :=
 def printExpr (e : MiniExpr) : String :=
   printExprWith defaultOptions e
 
-end Language.JavaScript.MiniAST
+end Language.TypeScript.MiniTsAST
 
